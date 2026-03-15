@@ -1,0 +1,12 @@
+#!/bin/bash
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd ${REPO_ROOT}
+
+mkdir -p ${REPO_ROOT}/images/agent-sandbox-controller
+cp -f ${REPO_ROOT}/Dockerfile ${REPO_ROOT}/images/agent-sandbox-controller/Dockerfile
+
+find ${REPO_ROOT}/k8s -type f -name "*.yaml" -exec sed -i 's|ko://sigs.k8s.io/agent-sandbox/cmd/agent-sandbox-controller|images.local/agent-sandbox-controller|g' {} +
+
+# Don't install extension version
+rm -f ${REPO_ROOT}/k8s/extensions.controller.yaml
