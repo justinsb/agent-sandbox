@@ -1183,6 +1183,18 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 			return nil
 		}
 
+		// The annotation exists to track ADOPTED pods whose name differs
+		// from the sandbox's (warm-pool adoption). For the common case --
+		// the controller created the pod under the sandbox's own name --
+		// it carries no information: resolvePodName and every out-of-tree
+		// reader fall back to the sandbox name when it is absent. Skipping
+		// the write here removes one API round-trip per launch (50k
+		// launches cost 50k annotation PATCHes plus ~16% of controller CPU
+		// in merge-patch serialization on the 100-node scaleup runs).
+		if podName == sandbox.Name {
+			return nil
+		}
+
 		patch := client.MergeFrom(sandbox.DeepCopy())
 		if sandbox.Annotations == nil {
 			sandbox.Annotations = make(map[string]string)
