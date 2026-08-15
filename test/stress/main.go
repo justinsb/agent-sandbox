@@ -268,7 +268,7 @@ func run(ctx context.Context) error {
 	flag.BoolVar(&cfg.CollectMetrics, "collect-metrics", true, "Whether to scrape Prometheus metrics from the control plane, the sandbox controller, and kubelets to metrics.jsonl.gz")
 	flag.DurationVar(&cfg.MetricsInterval, "metrics-interval", 15*time.Second, "Interval between Prometheus metrics scrapes")
 	flag.BoolVar(&cfg.ProfileAPIServer, "profile-apiserver", true, "Capture a kube-apiserver CPU profile during each throughput level (pprof-apiserver-<phase>.pprof)")
-	flag.BoolVar(&cfg.ProfileController, "profile-controller", true, "Capture agent-sandbox-controller CPU+heap profiles during the claims-warm burst (best-effort; the controller must run with --enable-pprof / --enable-pprof-debug)")
+	flag.BoolVar(&cfg.ProfileController, "profile-controller", true, "Capture agent-sandbox-controller CPU profiles during the claims-warm burst and the fill ready wave, plus heap profiles around the claims burst (best-effort; the controller must run with --enable-pprof / --enable-pprof-debug)")
 	flag.Parse()
 
 	for part := range strings.SplitSeq(*phasesFlag, ",") {
@@ -511,10 +511,13 @@ func run(ctx context.Context) error {
 		}
 	}
 
-	// CPU/heap-profile the sandbox controller during the claims phases
-	// (the controller is the suspected bottleneck of the adoption path).
+	// CPU/heap-profile the sandbox controller during the claims phases (the
+	// controller is the suspected bottleneck of the adoption path) and the
+	// fill phase's ready wave (where the pod-ready -> sandbox-Ready gap
+	// lives at launch scale). Best-effort: without --enable-pprof on the
+	// controller, captures log a 404 and the run continues.
 	var ctrlProfiler *controllerProfiler
-	if cfg.ProfileController && hasClaimsPhase(phases) {
+	if cfg.ProfileController {
 		ctrlProfiler, err = newControllerProfiler(restConfig, cfg.OutputDir)
 		if err != nil {
 			return fmt.Errorf("failed to build controller profiler: %w", err)

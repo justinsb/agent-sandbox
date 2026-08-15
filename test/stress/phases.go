@@ -159,6 +159,20 @@ func (s *stressTest) runFillPhase(ctx context.Context, name PhaseName, number Ph
 		return err
 	}
 
+	// Profile the ready wave: creates are done, so from here the phase is
+	// pods starting and the controller flipping Sandboxes to Ready --
+	// exactly the window where the pod-ready -> sandbox-Ready gap lives
+	// (p50 ~30s at 100 nodes / 50k sandboxes while the controller workqueue
+	// stayed shallow and apiserver fan-out to an external watcher measured
+	// ~1s, pointing at the controller's own event intake). The apiserver
+	// profile is the companion view for the same window.
+	if s.profiler != nil {
+		go s.profiler.CaptureCPUProfile(ctx, name, 0, 30*time.Second)
+	}
+	if s.ctrlProfiler != nil {
+		go s.ctrlProfiler.CaptureCPUProfile(ctx, name, 0, 30*time.Second)
+	}
+
 	// Wait for all successfully-created fill sandboxes to become Ready.
 	// If we stop making progress for PerSandboxTimeout, give up and report.
 	lastReady := -1
