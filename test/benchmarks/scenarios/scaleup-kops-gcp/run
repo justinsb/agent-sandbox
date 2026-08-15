@@ -117,6 +117,20 @@ export STRESS_SCHEDULER_BURST="${STRESS_SCHEDULER_BURST:-4000}"
 export STRESS_MAX_REQUESTS_INFLIGHT="${STRESS_MAX_REQUESTS_INFLIGHT:-3200}"
 export STRESS_MAX_MUTATING_INFLIGHT="${STRESS_MAX_MUTATING_INFLIGHT:-1600}"
 
+# Kubelet and KCM client limits: kubelets showed summed client throttle
+# wait during the launch waves (each kubelet posts several status updates
+# per pod); KCM is raised alongside as cheap insurance for pod-lifecycle
+# bookkeeping at wave scale. (kOps exposes no kubelet kubeAPIBurst field,
+# so only the sustained rate is tunable; see the base runner's note.)
+export STRESS_KUBELET_API_QPS="${STRESS_KUBELET_API_QPS:-1000}"
+export STRESS_KCM_QPS="${STRESS_KCM_QPS:-2000}"
+export STRESS_KCM_BURST="${STRESS_KCM_BURST:-2000}"
+
+# Warm-up lap: pre-pull the sandbox image on every node so the measured
+# window starts with hot image caches (matches the stress tool's default
+# --image).
+export STRESS_PREPULL_IMAGE="${STRESS_PREPULL_IMAGE:-debian:latest}"
+
 # The e2e benchmark suite adds nothing to this scenario's signal and would
 # run against a 10x-sized cluster; skip it.
 export RUN_BENCHMARK_SUITE=false

@@ -248,9 +248,12 @@ kops edit cluster --name "${CLUSTER_NAME}" \
 # cycled in ~8.8s of which only 1.6s was launch. Raising to 100/200 still
 # left KCM throttling client-side, so go to 500/500 to take the client
 # limiter out of the measurement entirely.
+# Overridable: 500/500 sufficed through the 100-node scaleup runs (zero
+# measured KCM throttle wait), but launch-wave shapes that leaning harder
+# on KCM can raise it via STRESS_KCM_QPS/BURST.
 kops edit cluster --name "${CLUSTER_NAME}" \
-  --set cluster.spec.kubeControllerManager.kubeAPIQPS=500 \
-  --set cluster.spec.kubeControllerManager.kubeAPIBurst=500
+  --set "cluster.spec.kubeControllerManager.kubeAPIQPS=${STRESS_KCM_QPS:-500}" \
+  --set "cluster.spec.kubeControllerManager.kubeAPIBurst=${STRESS_KCM_BURST:-500}"
 
 # etcdClusters[].manager.listenMetricsURLs: have etcd serve its dedicated
 # plain-HTTP metrics listener. etcd's client port requires mTLS, so the
@@ -301,8 +304,15 @@ kops edit cluster --name "${CLUSTER_NAME}" \
 # Note this is different from other rate limits: we drop extra events.
 # A diagnostics trade-off that is acceptable here, needs more careful
 # evaluation before using in production clusters.
+# Overridable: kubelets showed measurable client-side throttle wait during
+# the 100-node launch waves (~280s summed across the fleet at 500 QPS);
+# scaleup raises it via STRESS_KUBELET_API_QPS. Note kOps v1.36 exposes no
+# kubelet kubeAPIBurst field (KubeletConfigSpec has only KubeAPIQPS; the
+# kubelet's client burst stays at its default 100), so the client-go
+# limiter's bucket depth cannot be tuned from here — QPS is the refill
+# rate and carries the sustained load regardless.
 kops edit cluster --name "${CLUSTER_NAME}" \
-  --set cluster.spec.kubelet.kubeAPIQPS=500 \
+  --set "cluster.spec.kubelet.kubeAPIQPS=${STRESS_KUBELET_API_QPS:-500}" \
   --set cluster.spec.kubelet.eventQPS=5 \
   --set cluster.spec.kubelet.eventBurst=50
 
@@ -472,6 +482,44 @@ fi
 # Comparing the two mif400 legs separates the launch pipeline's own cost
 # from the cost of resident-pod scale (kubelet status load, watch fanout,
 # etcd working set).
+# Optional image pre-pull (STRESS_PREPULL_IMAGE): warm every worker node's
+# image cache before the measured phase. Without it, each node pays the
+# sandbox image pull for its first pod INSIDE the measurement window --
+# the 125-node scaleup run's first Ready landed at 13.3s, almost entirely
+# pull time. The DaemonSet is deleted (and its pods drained) before the
+# stress test starts, so capacity accounting is unaffected; the image
+# stays in the node-local cache.
+if [[ -n "${STRESS_PREPULL_IMAGE:-}" ]]; then
+  echo "Pre-pulling ${STRESS_PREPULL_IMAGE} on all worker nodes..."
+  kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: image-prepull
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: image-prepull
+  template:
+    metadata:
+      labels:
+        app: image-prepull
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+      - name: prepull
+        image: ${STRESS_PREPULL_IMAGE}
+        command: ["sh", "-c", "trap 'exit 0' TERM INT; sleep infinity & wait"]
+EOF
+  kubectl rollout status daemonset/image-prepull --namespace default --timeout=15m
+  kubectl delete daemonset/image-prepull --namespace default --wait=true
+  # Wait for the prepull pods to actually vanish so the stress preflight's
+  # pre-existing pod count is clean.
+  kubectl wait --for=delete pods --selector=app=image-prepull --namespace default --timeout=5m 2>/dev/null || true
+  echo "Image pre-pull complete."
+fi
+
 STRESS_OUTPUT_DIR="${ARTIFACTS:-.}/stress-test/"
 mkdir -p "${STRESS_OUTPUT_DIR}"
 
