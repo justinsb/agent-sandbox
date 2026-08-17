@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -83,6 +84,7 @@ func main() {
 	var sandboxWarmPoolMaxRefillRate float64
 	var sandboxWriteBehindWindow time.Duration
 	var sandboxTransitionalStatusWindow time.Duration
+	var gcPercent int
 	var enableWarmPoolEviction bool
 	var cacheLabelSelectors bool
 	var printVersion bool
@@ -175,6 +177,11 @@ func main() {
 			"by the previous process. Default false (annotations persisted).")
 	flag.DurationVar(&sandboxWriteBehindWindow, "sandbox-write-behind-window", 0,
 		"Coalescing window for the Sandbox controller's recoverable metadata-only writes. 0 disables coalescing.")
+	flag.IntVar(&gcPercent, "gc-percent", 0,
+		"If > 0, sets the Go garbage collector target percentage (debug.SetGCPercent / GOGC). The controller's launch-path "+
+			"work is allocation-heavy (JSON decode of CRD watch events, patch serialization): at 100k-sandbox launch waves "+
+			"~31% of controller CPU was GC with the default GOGC=100. Raising to 300-400 trades heap headroom for a large "+
+			"share of that time. 0 leaves the Go default (or the GOGC env var) in effect.")
 	flag.DurationVar(&sandboxTransitionalStatusWindow, "sandbox-transitional-status-window", 0,
 		"Defer transitional Sandbox status writes (reason/message churn and field fills while no condition changes value) "+
 			"for sandboxes younger than this window: a launch that reaches Ready inside the window writes status exactly once, "+
@@ -240,6 +247,14 @@ func main() {
 		setupLog.Error(nil, "sandbox-transitional-status-window must be >= 0 (0 disables transitional-status deferral)",
 			"value", sandboxTransitionalStatusWindow)
 		os.Exit(1)
+	}
+	if gcPercent < 0 {
+		setupLog.Error(nil, "gc-percent must be >= 0 (0 leaves the Go default / GOGC env in effect)", "value", gcPercent)
+		os.Exit(1)
+	}
+	if gcPercent > 0 {
+		previous := debug.SetGCPercent(gcPercent)
+		setupLog.Info("Set GC target percentage (--gc-percent)", "gcPercent", gcPercent, "previous", previous)
 	}
 	// A logical maximum (too much will create unnecessary load on the API server)
 	totalWorkers := sandboxConcurrentWorkers + sandboxClaimConcurrentWorkers + sandboxWarmPoolConcurrentWorkers + sandboxTemplateConcurrentWorkers
