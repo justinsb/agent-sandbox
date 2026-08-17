@@ -217,8 +217,18 @@ kops edit instancegroup --name "${CLUSTER_NAME}" "nodes-${ZONE}" \
 # CP root - the etcd data volumes are separate PDs and already pd-ssd by
 # kOps' GCE default (DefaultGCEEtcdVolumeType; measured 1.5ms mean fsync) -
 # so this is an enabler, not a tuning claim.
+# Overridable because the C4/C4D machine families do not support
+# persistent disks at all -- hyperdisk-balanced is required there.
 kops edit instancegroup --name "${CLUSTER_NAME}" "control-plane-${ZONE}" \
-  --set "spec.rootVolume.type=pd-ssd"
+  --set "spec.rootVolume.type=${STRESS_CP_ROOT_VOLUME_TYPE:-pd-ssd}"
+
+# Etcd data volume type (same C4/C4D constraint; kops default is pd-ssd).
+if [[ -n "${STRESS_ETCD_VOLUME_TYPE:-}" ]]; then
+  echo "Setting etcd volume type=${STRESS_ETCD_VOLUME_TYPE}"
+  kops edit cluster --name "${CLUSTER_NAME}" \
+    --set "cluster.spec.etcdClusters[0].etcdMembers[0].volumeType=${STRESS_ETCD_VOLUME_TYPE}" \
+    --set "cluster.spec.etcdClusters[1].etcdMembers[0].volumeType=${STRESS_ETCD_VOLUME_TYPE}"
+fi
 
 # authorizationAlwaysAllowPaths: allow unauthenticated GETs of /metrics on
 # kube-controller-manager and kube-scheduler so the stress test can scrape
@@ -275,6 +285,31 @@ kops edit cluster --name "${CLUSTER_NAME}" \
   --set 'cluster.spec.etcdClusters[0].manager.listenMetricsURLs=http://0.0.0.0:2391' \
   --set 'cluster.spec.etcdClusters[1].manager.listenMetricsURLs=http://0.0.0.0:2392'
 
+# etcd database size limit (STRESS_ETCD_QUOTA_BYTES): etcd refuses all
+# writes once its database file reaches the quota (default 2GiB). A
+# 100k-pod launch peaks the database at 1.4-1.8GiB and one run tripped
+# the limit outright. Raising it removes the landmine; measured latency
+# does NOT depend on database size below the limit, so this is safety,
+# not speed.
+if [[ -n "${STRESS_ETCD_QUOTA_BYTES:-}" ]]; then
+  echo "Setting etcd quota-backend-bytes=${STRESS_ETCD_QUOTA_BYTES}"
+  kops edit cluster --name "${CLUSTER_NAME}" \
+    --set "cluster.spec.etcdClusters[0].manager.env[0].name=ETCD_QUOTA_BACKEND_BYTES" \
+    --set "cluster.spec.etcdClusters[0].manager.env[0].value=${STRESS_ETCD_QUOTA_BYTES}" \
+    --set "cluster.spec.etcdClusters[1].manager.env[0].name=ETCD_QUOTA_BACKEND_BYTES" \
+    --set "cluster.spec.etcdClusters[1].manager.env[0].value=${STRESS_ETCD_QUOTA_BYTES}"
+fi
+
+# How often the apiserver asks etcd to discard old object revisions
+# (STRESS_ETCD_COMPACTION_INTERVAL, apiserver --etcd-compaction-interval,
+# default 5m). A launch shorter than the interval accumulates every
+# revision it writes; compacting more often keeps the database small.
+if [[ -n "${STRESS_ETCD_COMPACTION_INTERVAL:-}" ]]; then
+  echo "Setting etcd compaction interval=${STRESS_ETCD_COMPACTION_INTERVAL}"
+  kops edit cluster --name "${CLUSTER_NAME}" \
+    --set "cluster.spec.kubeAPIServer.compactionInterval=${STRESS_ETCD_COMPACTION_INTERVAL}"
+fi
+
 # kubeScheduler.qps/burst: the scheduler's client defaults (50/100) throttle
 # it under churn -- every sandbox is a pod to schedule, and each pod costs
 # the scheduler a binding plus status writes, which shows up as
@@ -311,10 +346,16 @@ kops edit cluster --name "${CLUSTER_NAME}" \
 # kubelet's client burst stays at its default 100), so the client-go
 # limiter's bucket depth cannot be tuned from here — QPS is the refill
 # rate and carries the sustained load regardless.
+# Event knobs overridable: at 100k-launch scale the kubelets' Pulled/
+# Created/Started events were the single largest apiserver request
+# category (155k of 257k event POSTs) and compete for the same priority
+# seats as the pod status PATCHes that gate observed readiness; scaleup
+# floors them at 1/1. CAUTION: eventQPS=0 means UNLIMITED in
+# KubeletConfiguration, not disabled -- 1 is the minimum throttle.
 kops edit cluster --name "${CLUSTER_NAME}" \
   --set "cluster.spec.kubelet.kubeAPIQPS=${STRESS_KUBELET_API_QPS:-500}" \
-  --set cluster.spec.kubelet.eventQPS=5 \
-  --set cluster.spec.kubelet.eventBurst=50
+  --set "cluster.spec.kubelet.eventQPS=${STRESS_KUBELET_EVENT_QPS:-5}" \
+  --set "cluster.spec.kubelet.eventBurst=${STRESS_KUBELET_EVENT_BURST:-50}"
 
 # kubeAPIServer.maxRequestsInflight/maxMutatingRequestsInflight (defaults
 # 400/200): APF's total seat budget is derived from these two flags and
@@ -328,6 +369,18 @@ kops edit cluster --name "${CLUSTER_NAME}" \
 kops edit cluster --name "${CLUSTER_NAME}" \
   --set "cluster.spec.kubeAPIServer.maxRequestsInflight=${STRESS_MAX_REQUESTS_INFLIGHT:-1600}" \
   --set "cluster.spec.kubeAPIServer.maxMutatingRequestsInflight=${STRESS_MAX_MUTATING_INFLIGHT:-800}"
+
+# Kubelet log verbosity (STRESS_KUBELET_LOG_LEVEL): v>=2 logs "SyncLoop
+# ADD" with the kubelet-side timestamp a pod ARRIVES at the kubelet -- the
+# ground truth that separates apiserver->kubelet watch delivery lag from
+# kubelet-internal queueing, which no exported metric distinguishes. v=4
+# adds pod-worker and status-manager detail. Capture the journals with
+# STRESS_CAPTURE_KUBELET_LOGS below.
+if [[ -n "${STRESS_KUBELET_LOG_LEVEL:-}" ]]; then
+  echo "Setting kubelet logLevel=${STRESS_KUBELET_LOG_LEVEL}"
+  kops edit cluster --name "${CLUSTER_NAME}" \
+    --set "cluster.spec.kubelet.logLevel=${STRESS_KUBELET_LOG_LEVEL}"
+fi
 
 # kubelet.maxPods (default 110): pod-density scenarios (scaleup-kops-gcp
 # packs 500 sandboxes onto every node) need the kubelet cap raised.
@@ -427,6 +480,28 @@ for manifest in ${STRESS_EXTRA_MANIFESTS:-}; do
   echo "Applying extra manifest ${manifest}..."
   kubectl apply -f "${manifest}"
 done
+
+# Optional scheduler partitioning (STRESS_NODE_PARTITIONS=N): label worker
+# nodes round-robin into N disjoint partitions (scaleup-partition=0..N-1).
+# Used with the stress tool's --scheduler-names + --scheduler-partition-label
+# to give each scheduler instance its own slice of the fleet: independent
+# schedulers racing over SHARED nodes overbook them past maxPods within
+# their watch lag (857 OutOfpods pods on the first 5-scheduler 100k run);
+# disjoint partitions remove the race by construction and shrink each
+# scheduler's filter set.
+if [[ -n "${STRESS_NODE_PARTITIONS:-}" ]]; then
+  echo "Labeling worker nodes into ${STRESS_NODE_PARTITIONS} scheduler partitions..."
+  WORKER_NODES=$(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o name)
+  # Assign round-robin, then label one partition per kubectl call.
+  for p in $(seq 0 $((STRESS_NODE_PARTITIONS - 1))); do
+    NODES_IN_PARTITION=$(echo "${WORKER_NODES}" | awk -v p="${p}" -v n="${STRESS_NODE_PARTITIONS}" 'NR % n == p')
+    if [[ -n "${NODES_IN_PARTITION}" ]]; then
+      # shellcheck disable=SC2086
+      kubectl label --overwrite ${NODES_IN_PARTITION} "scaleup-partition=${p}" > /dev/null
+      echo "  partition ${p}: $(echo "${NODES_IN_PARTITION}" | wc -l | tr -d ' ') nodes"
+    fi
+  done
+fi
 
 # Serve only the beta API: the mere presence of a v1alpha1 version
 # causes the kube-apiserver to build a v1alpha1 version for every resource,
@@ -529,6 +604,30 @@ capture_stress_diagnostics() {
   kubectl get pods -A -o wide > "${STRESS_OUTPUT_DIR}/pods.txt" || true
   kubectl get nodes -o wide > "${STRESS_OUTPUT_DIR}/nodes.txt" || true
   kubectl top nodes > "${STRESS_OUTPUT_DIR}/top-nodes.txt" 2>/dev/null || true
+
+  # Kubelet journal excerpts from a sample of worker nodes, via node debug
+  # pods (API path -- no SSH keys). Filtered node-side to the launch-path
+  # lines ("SyncLoop ADD" = the kubelet-side pod ARRIVAL stamp, "SyncPod"
+  # = worker dispatch) with microsecond timestamps, so the output fits the
+  # container log size cap. Errors land in kubelet-capture.err, not /dev/null.
+  if [[ -n "${STRESS_CAPTURE_KUBELET_LOGS:-}" ]]; then
+    echo "Capturing kubelet journal excerpts from ${STRESS_CAPTURE_KUBELET_LOGS} nodes..."
+    CAPTURE_ERR="${STRESS_OUTPUT_DIR}/kubelet-capture.err"
+    for node in $(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | head -n "${STRESS_CAPTURE_KUBELET_LOGS}"); do
+      kubectl debug "node/${node}" --image=debian:stable-slim --profile=sysadmin --attach=false -- \
+        chroot /host /bin/sh -c "journalctl -u kubelet.service --no-pager --since=-40min -o short-iso-precise | grep -E 'SyncLoop ADD|SyncPod ' || true" \
+        >> "${CAPTURE_ERR}" 2>&1 || { echo "  FAILED to create debug pod for ${node}"; continue; }
+      dbgpod=$(kubectl get pods -o name | grep "node-debugger-${node}" | tail -1)
+      if [[ -n "${dbgpod}" ]] \
+        && kubectl wait --for=jsonpath='{.status.phase}'=Succeeded "${dbgpod}" --timeout=180s >> "${CAPTURE_ERR}" 2>&1; then
+        kubectl logs "${dbgpod}" 2>> "${CAPTURE_ERR}" | gzip -c > "${STRESS_OUTPUT_DIR}/kubelet-${node}.log.gz"
+        echo "  captured ${node} ($(ls -la "${STRESS_OUTPUT_DIR}/kubelet-${node}.log.gz" | awk '{print $5}') bytes gz)"
+      else
+        echo "  FAILED ${node} (see kubelet-capture.err)"
+      fi
+      [[ -n "${dbgpod}" ]] && kubectl delete "${dbgpod}" --wait=false >> "${CAPTURE_ERR}" 2>&1
+    done
+  fi
 }
 
 echo "Running stress test"
