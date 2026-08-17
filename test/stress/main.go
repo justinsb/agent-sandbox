@@ -199,6 +199,26 @@ type Config struct {
 	// latency measurement.
 	SustainedLifecycleBudget time.Duration `json:"sustainedLifecycleBudgetNanos"`
 
+	// FillCreateRate paces the fill phase's creates at a fixed rate in
+	// sandboxes/s (0 = closed-loop dump, the historical behavior). See
+	// runFillPhase for why pacing at the apiserver's watch-intake ceiling
+	// keeps end-to-end latency flat.
+	FillCreateRate float64 `json:"fillCreateRate,omitempty"`
+
+	// SchedulerNames spreads sandboxes across multiple scheduler instances
+	// via spec.podTemplate.spec.schedulerName (FNV hash of the sandbox
+	// name). A single kube-scheduler is one serial scheduling loop
+	// (~1,450 pods/s measured at both 125 and 250 nodes); N instances give
+	// ~N x that. Empty = schedulerName left unset (default scheduler only).
+	SchedulerNames []string `json:"schedulerNames,omitempty"`
+
+	// SchedulerPartitionLabel, when set alongside SchedulerNames, confines
+	// each scheduler lane's sandboxes to the nodes labeled
+	// <label>=<laneIndex> (the scenario labels nodes round-robin with the
+	// same modulus). Disjoint partitions prevent independent schedulers
+	// from overbooking shared nodes past maxPods within their watch lag.
+	SchedulerPartitionLabel string `json:"schedulerPartitionLabel,omitempty"`
+
 	// ClientConnections shards the harness's own mutating requests across N
 	// HTTP/2 connections (1 = share the watches' single connection, the
 	// historical behavior). The apiserver caps ~100 concurrent streams per
@@ -258,12 +278,15 @@ func run(ctx context.Context) error {
 	flag.IntVar(&cfg.ThroughputCount, "throughput-count", 200, "Number of Sandboxes to churn per throughput phase (before --throughput-min-seconds)")
 	flag.Float64Var(&cfg.ThroughputMinSeconds, "throughput-min-seconds", 45, "Minimum duration of each throughput phase; levels churn beyond -throughput-count until this much time has elapsed (0 = count-based only)")
 	flag.IntVar(&cfg.ClaimsWarmCount, "claims-warm-count", 300, "Warm pool size and number of simultaneous SandboxClaims for the claims-warm phase (requires the extensions controller)")
+	flag.Float64Var(&cfg.FillCreateRate, "fill-create-rate", 0, "Pace the fill phase creates at this rate in sandboxes/s (0 = closed-loop, as fast as the workers go)")
 	flag.Float64Var(&cfg.SustainedRate, "sustained-rate", 300, "Target SandboxClaim arrival rate in claims/s (Poisson-jittered) for the claims-warm-sustained phase (requires the extensions controller)")
 	flag.Float64Var(&cfg.SustainedSeconds, "sustained-seconds", 60, "Duration of the claims-warm-sustained arrival window in seconds")
 	flag.DurationVar(&cfg.ClaimDwell, "claim-dwell", 5*time.Second, "How long each sustained claim is held after Ready before deletion")
 	flag.IntVar(&cfg.SustainedNamespaces, "sustained-namespaces", 1, "Spread the sustained phase's pools and claims across N pre-created namespaces (1 = run in the test namespace)")
 	flag.DurationVar(&cfg.SustainedPoolHeadroom, "sustained-pool-headroom", 10*time.Second, "Warm pool sizing for the sustained phase: each namespace's pool has ceil(rate/namespaces * headroom-seconds) replicas; must cover the controller's worst-case refill latency")
 	flag.DurationVar(&cfg.SustainedLifecycleBudget, "sustained-lifecycle-budget", 5*time.Second, "Assumed per-claim ready+delete pipeline time (beyond --claim-dwell) used to size the sustained phase's pod-capacity estimate; raise it if the cluster's Ready/delete path is slower under load")
+	schedulerNamesFlag := flag.String("scheduler-names", "", "Comma-separated spec.schedulerName values to spread sandboxes across (stable hash of sandbox name). Include \"default-scheduler\" to keep it as one of the lanes. Empty = leave schedulerName unset.")
+	flag.StringVar(&cfg.SchedulerPartitionLabel, "scheduler-partition-label", "", "Node label key pairing each --scheduler-names lane with a disjoint node partition: lane i's sandboxes get nodeSelector <label>=<i>. Requires nodes labeled round-robin with the same modulus (see STRESS_NODE_PARTITIONS in the kops-gcp runner). Empty = no partitioning.")
 	flag.IntVar(&cfg.ClientConnections, "client-connections", 1, "Shard the harness's mutating API requests across N HTTP/2 connections; 1 = single connection shared with watches (historical behavior, subject to the apiserver's ~100-streams-per-connection cap)")
 	flag.BoolVar(&cfg.CollectMetrics, "collect-metrics", true, "Whether to scrape Prometheus metrics from the control plane, the sandbox controller, and kubelets to metrics.jsonl.gz")
 	flag.DurationVar(&cfg.MetricsInterval, "metrics-interval", 15*time.Second, "Interval between Prometheus metrics scrapes")
@@ -277,6 +300,13 @@ func run(ctx context.Context) error {
 			continue
 		}
 		cfg.Phases = append(cfg.Phases, name)
+	}
+	for part := range strings.SplitSeq(*schedulerNamesFlag, ",") {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			continue
+		}
+		cfg.SchedulerNames = append(cfg.SchedulerNames, name)
 	}
 	if len(cfg.Phases) == 0 {
 		return fmt.Errorf("--phases must list at least one phase")

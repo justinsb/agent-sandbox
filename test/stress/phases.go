@@ -17,7 +17,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"log"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,6 +29,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
+
+	"golang.org/x/time/rate"
 )
 
 // stressTest bundles the shared state used by the test phases.
@@ -71,7 +75,50 @@ type stressTest struct {
 // while a foreground child is running. terminationGracePeriodSeconds=1 is the
 // backstop if the trap fails. automountServiceAccountToken is disabled so
 // kubelet does not project a token volume (noticeable under high churn).
-func buildSandboxObject(id types.NamespacedName, image string) *unstructured.Unstructured {
+func buildSandboxObject(id types.NamespacedName, image string, lane schedulerLane) *unstructured.Unstructured {
+	podSpec := map[string]any{
+		"restartPolicy":                 "Never",
+		"terminationGracePeriodSeconds": int64(1),
+		"automountServiceAccountToken":  false,
+		"containers": []any{
+			map[string]any{
+				"name":            "main",
+				"image":           image,
+				"imagePullPolicy": "IfNotPresent",
+				"command":         []string{"sh", "-c", "trap 'exit 0' TERM INT; sleep infinity & wait"},
+				// A nominal CPU request so scheduler scoring has a
+				// gradient: zero-request pods make every node score
+				// identically, and placement then rides on tie-breaking
+				// alone -- observed to degenerate into node-stuffing
+				// under sharded schedulers (median node received 290 of
+				// its 400 pods within 5s by the scheduler's own event
+				// stamps; containerd's run_podsandbox degraded 1.1s ->
+				// 5.3s under the resulting concurrency). Real sandbox
+				// workloads carry requests; 5m keeps the benchmark honest
+				// without meaningfully constraining bin-packing
+				// (400 pods x 5m = 2 of 8 cores).
+				"resources": map[string]any{
+					"requests": map[string]any{
+						"cpu": "5m",
+					},
+				},
+			},
+		},
+	}
+	// A single kube-scheduler is one serial scheduling loop (~1,450 pods/s
+	// measured); --scheduler-names shards sandboxes across multiple
+	// scheduler instances to multiply that (see pickSchedulerLane).
+	if lane.name != "" {
+		podSpec["schedulerName"] = lane.name
+	}
+	// Pin the sandbox to its lane's node partition. Without this,
+	// independent schedulers race over shared nodes and overbook them past
+	// maxPods within their watch lag (observed: 857 OutOfpods rejections
+	// across 100k pods with 5 shared-fleet schedulers); disjoint partitions
+	// remove the race entirely.
+	if lane.partitionSelector != nil {
+		podSpec["nodeSelector"] = lane.partitionSelector
+	}
 	return &unstructured.Unstructured{
 		Object: map[string]any{
 			"apiVersion": "agents.x-k8s.io/v1beta1",
@@ -82,30 +129,48 @@ func buildSandboxObject(id types.NamespacedName, image string) *unstructured.Uns
 			},
 			"spec": map[string]any{
 				"podTemplate": map[string]any{
-					"spec": map[string]any{
-						"restartPolicy":                 "Never",
-						"terminationGracePeriodSeconds": int64(1),
-						"automountServiceAccountToken":  false,
-						"containers": []any{
-							map[string]any{
-								"name":            "main",
-								"image":           image,
-								"imagePullPolicy": "IfNotPresent",
-								"command":         []string{"sh", "-c", "trap 'exit 0' TERM INT; sleep infinity & wait"},
-							},
-						},
-					},
+					"spec": podSpec,
 				},
 			},
 		},
 	}
 }
 
+// schedulerLane is one scheduler instance's share of the fleet: the
+// schedulerName to stamp on the pod spec and, when partitioning is enabled
+// (--scheduler-partition-label), the nodeSelector confining the pod to
+// that scheduler's disjoint node slice.
+type schedulerLane struct {
+	name              string
+	partitionSelector map[string]any
+}
+
+// pickSchedulerLane spreads sandboxes across the configured scheduler
+// lanes by FNV-1a hash of the sandbox name: deterministic (a rerun of the
+// same name lands on the same scheduler), evenly distributed at fleet
+// scale, and free of shared state across the create workers. Lane index i
+// pairs with node partition i (the scenario labels nodes round-robin with
+// the same modulus). Empty names means "leave schedulerName unset" (the
+// default scheduler, whole fleet).
+func pickSchedulerLane(cfg Config, sandboxName string) schedulerLane {
+	if len(cfg.SchedulerNames) == 0 {
+		return schedulerLane{}
+	}
+	h := fnv.New32a()
+	h.Write([]byte(sandboxName))
+	idx := int(h.Sum32() % uint32(len(cfg.SchedulerNames)))
+	lane := schedulerLane{name: cfg.SchedulerNames[idx]}
+	if cfg.SchedulerPartitionLabel != "" {
+		lane.partitionSelector = map[string]any{cfg.SchedulerPartitionLabel: strconv.Itoa(idx)}
+	}
+	return lane
+}
+
 // createSandbox registers a record and issues the Create call.
 // Create errors are recorded on the SandboxRecord rather than returned:
 // individual failures should not abort the run, they are reported in the summary.
 func (s *stressTest) createSandbox(ctx context.Context, id types.NamespacedName, name PhaseName, number PhaseNumber) error {
-	sandbox := buildSandboxObject(id, s.cfg.Image)
+	sandbox := buildSandboxObject(id, s.cfg.Image, pickSchedulerLane(s.cfg, id.Name))
 	s.tracker.Register(id, name, number)
 	_, err := s.sandboxClient.Create(ctx, sandbox, metav1.CreateOptions{})
 	s.tracker.MarkCreateReturned(id, err)
@@ -151,7 +216,24 @@ func (s *stressTest) runFillPhase(ctx context.Context, name PhaseName, number Ph
 		names = append(names, types.NamespacedName{Name: fmt.Sprintf("p%d-fill-%d", number, i), Namespace: s.namespace})
 	}
 
+	// Open-loop pacing (--fill-create-rate): admit creates at a fixed
+	// rate instead of dumping them as fast as the workers go. The
+	// apiserver consumes the resulting pod events through one serial
+	// loop per resource (~5-6k events/s measured); a dump front-loads
+	// ~10k events/s against that and every pod then pays queueing tax on
+	// each of its ~4 events. Pacing at or below the intake ceiling keeps
+	// the pipeline latency flat end to end.
+	var limiter *rate.Limiter
+	if s.cfg.FillCreateRate > 0 {
+		limiter = rate.NewLimiter(rate.Limit(s.cfg.FillCreateRate), s.cfg.CreateConcurrency)
+		log.Printf("[%s#%d] pacing creates at %.0f/s", name, number, s.cfg.FillCreateRate)
+	}
 	if _, err := ForkJoin(ctx, names, s.cfg.CreateConcurrency, func(id types.NamespacedName) (struct{}, error) {
+		if limiter != nil {
+			if err := limiter.Wait(ctx); err != nil {
+				return struct{}{}, nil
+			}
+		}
 		// Errors are recorded per-sandbox; do not abort the phase.
 		_ = s.createSandbox(ctx, id, name, number)
 		return struct{}{}, nil
