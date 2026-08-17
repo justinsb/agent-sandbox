@@ -100,13 +100,24 @@ export STRESS_CONTROL_PLANE_SIZE="${STRESS_CONTROL_PLANE_SIZE:-c3-standard-88}"
 # 200 nodes converge slower than the benchmark's 20.
 export STRESS_VALIDATE_WAIT="${STRESS_VALIDATE_WAIT:-25m}"
 
-# Scheduler client QPS: the proven wall at this scale. The 100-node run at
-# the benchmark's 500/500 pinned the scheduler's client rate limiter (11.4s
-# mean queued wait per request) and capped ready-throughput at ~470/s.
-# ~2 scheduler requests per pod placed means the 1,667/s target needs
-# ~3,400 req/s; 4000 keeps the limiter out of the measurement.
-export STRESS_SCHEDULER_QPS="${STRESS_SCHEDULER_QPS:-4000}"
-export STRESS_SCHEDULER_BURST="${STRESS_SCHEDULER_BURST:-4000}"
+# Per-lane scheduler client QPS doubles as the pipeline's PACING valve.
+# Unthrottled 5-lane scheduling (run 16) delivered 400 pods to each node
+# near-simultaneously and containerd's sandbox setup collapsed under its
+# own concurrency (CRI run_podsandbox 1.1s -> 5.3s mean; per-node rate
+# DOWN 22%). Nodes sustain ~12 pods/s when fed steadily, so shape the
+# aggregate arrival to ~2,300-2,500/s: ~2 scheduler API calls per pod
+# means lane QPS ~1000 ~= ~500 binds/s/lane.
+SCALEUP_SCHEDULER_LANE_QPS="${SCALEUP_SCHEDULER_LANE_QPS:-1000}"
+
+# Default-scheduler client QPS. History: 500/500 was the first wall of the
+# campaign (11.4s mean limiter wait, ~470/s ceiling) and we raised it to
+# 4000 to get the limiter out of the way. With scheduler sharding the same
+# limiter becomes the deliberate PACING valve (see
+# SCALEUP_SCHEDULER_LANE_QPS above): the default lane is throttled to
+# match the extra lanes so every partition's nodes receive pods at the
+# rate they can absorb.
+export STRESS_SCHEDULER_QPS="${STRESS_SCHEDULER_QPS:-${SCALEUP_SCHEDULER_LANE_QPS:-1000}}"
+export STRESS_SCHEDULER_BURST="${STRESS_SCHEDULER_BURST:-${SCALEUP_SCHEDULER_LANE_QPS:-1000}}"
 
 # APF seat budget: with the scheduler's client limiter removed, its bindings
 # queued server-side in workload-high (338k queued seconds on the 100-node
@@ -125,6 +136,14 @@ export STRESS_MAX_MUTATING_INFLIGHT="${STRESS_MAX_MUTATING_INFLIGHT:-1600}"
 export STRESS_KUBELET_API_QPS="${STRESS_KUBELET_API_QPS:-1000}"
 export STRESS_KCM_QPS="${STRESS_KCM_QPS:-2000}"
 export STRESS_KCM_BURST="${STRESS_KCM_BURST:-2000}"
+
+# Kubelet events floored to 1/s (0 would mean UNLIMITED): pods start in
+# ~1s on the nodes in every configuration tested; the launch clock is
+# gated by each kubelet's one-at-a-time status writer, whose speed is the
+# apiserver's write latency. Kubelet events were the largest request
+# category (155k/run) sharing that path and are pure diagnostics here.
+export STRESS_KUBELET_EVENT_QPS="${STRESS_KUBELET_EVENT_QPS:-1}"
+export STRESS_KUBELET_EVENT_BURST="${STRESS_KUBELET_EVENT_BURST:-1}"
 
 # Warm-up lap: pre-pull the sandbox image on every node so the measured
 # window starts with hot image caches (matches the stress tool's default
@@ -145,12 +164,206 @@ export STRESS_FILL_PER_NODE="${SCALEUP_PODS_PER_NODE}"
 export STRESS_CREATE_CONCURRENCY="${STRESS_CREATE_CONCURRENCY:-1600}"
 CLIENT_CONNECTIONS=$(( (STRESS_CREATE_CONCURRENCY + 99) / 100 ))
 
+# External schedulers: a single kube-scheduler is one serial scheduling
+# loop -- measured ~700us/pod (~1,450 pods/s) at BOTH 125 and 250 nodes,
+# which made per-node launch rate 1,450/nodes and put the 100k full leg's
+# floor at ~69s of scheduling alone. N extra stock kube-scheduler
+# instances (own schedulerName profile each, leader election off, on the
+# control-plane node next to the apiserver) multiply the loop; the stress
+# harness spreads sandboxes across all lanes via --scheduler-names.
+# Conflict risk between schedulers is low at our density: nodes run 400 of
+# 512 maxPods, so capacity races only matter near-full.
+SCALEUP_EXTRA_SCHEDULERS="${SCALEUP_EXTRA_SCHEDULERS:-4}"
+SCALEUP_SCHEDULER_IMAGE="${SCALEUP_SCHEDULER_IMAGE:-registry.k8s.io/kube-scheduler:v1.36.3}"
+
+# (SCALEUP_SCHEDULER_LANE_QPS is defined above, next to the default
+# scheduler's matching throttle.)
+SCHEDULER_NAMES_FLAG=""
+if (( SCALEUP_EXTRA_SCHEDULERS > 0 )); then
+  SCHED_MANIFEST="$(mktemp -d)/extra-schedulers.yaml"
+  {
+    cat <<'EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sandbox-scheduler
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sandbox-scheduler:kube-scheduler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:kube-scheduler
+subjects:
+- kind: ServiceAccount
+  name: sandbox-scheduler
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sandbox-scheduler:volume-scheduler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:volume-scheduler
+subjects:
+- kind: ServiceAccount
+  name: sandbox-scheduler
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sandbox-scheduler:authentication-reader
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+- kind: ServiceAccount
+  name: sandbox-scheduler
+  namespace: kube-system
+EOF
+    # Optionally exempt scheduler traffic from APF queueing
+    # (SCALEUP_SCHEDULER_APF_EXEMPT=true). Measured both ways at 100k:
+    # workload-high queued 846k s (~3.7s/request) on the lane schedulers'
+    # bindings (run 19/20), but exempting them made the TOTAL worse
+    # (104.7s -> 126.0s): the freed flood reached the kubelet/status path,
+    # which congested at the crest and blew out the tail (p99 99.6s ->
+    # 108.4s) even as p50 improved (52.8s -> 51.2s). This pipeline
+    # conserves queueing -- removing backpressure upstream relocates the
+    # queue downstream -- so the exemption stays off until the apiserver
+    # write path itself is widened (dedicated apiserver instance group).
+    if [[ "${SCALEUP_SCHEDULER_APF_EXEMPT:-false}" == "true" ]]; then
+      cat <<'EOF'
+---
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: FlowSchema
+metadata:
+  name: sandbox-schedulers-exempt
+spec:
+  matchingPrecedence: 100
+  priorityLevelConfiguration:
+    name: exempt
+  distinguisherMethod:
+    type: ByUser
+  rules:
+  - subjects:
+    - kind: ServiceAccount
+      serviceAccount:
+        name: sandbox-scheduler
+        namespace: kube-system
+    - kind: User
+      user:
+        name: system:kube-scheduler
+    resourceRules:
+    - verbs: ["*"]
+      apiGroups: ["*"]
+      resources: ["*"]
+      clusterScope: true
+      namespaces: ["*"]
+EOF
+    fi
+    for (( i = 1; i <= SCALEUP_EXTRA_SCHEDULERS; i++ )); do
+      cat <<EOF
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sandbox-scheduler-${i}
+  namespace: kube-system
+data:
+  config.yaml: |
+    apiVersion: kubescheduler.config.k8s.io/v1
+    kind: KubeSchedulerConfiguration
+    leaderElection:
+      leaderElect: false
+    clientConnection:
+      qps: ${SCALEUP_SCHEDULER_LANE_QPS}
+      burst: ${SCALEUP_SCHEDULER_LANE_QPS}
+    # Score the ENTIRE partition every cycle. With a 50-node partition,
+    # percentageOfNodesToScore=10 sampled just 5 candidates per cycle and
+    # each lane firehosed one node at a time (median node received 289 of
+    # its 400 pods within 5s; containerd's run_podsandbox degraded 1.1s ->
+    # 5.3s under ~300 concurrent sandbox setups). Scoring 50 nodes is
+    # cheap, and least-allocated spreading across the whole partition is
+    # what keeps per-node arrival at a rate containerd can absorb.
+    percentageOfNodesToScore: 100
+    profiles:
+    - schedulerName: sandbox-scheduler-${i}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-scheduler-${i}
+  namespace: kube-system
+  labels:
+    app: sandbox-scheduler-${i}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sandbox-scheduler-${i}
+  template:
+    metadata:
+      labels:
+        app: sandbox-scheduler-${i}
+    spec:
+      serviceAccountName: sandbox-scheduler
+      priorityClassName: system-cluster-critical
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: kube-scheduler
+        image: ${SCALEUP_SCHEDULER_IMAGE}
+        command:
+        - kube-scheduler
+        - --config=/etc/sandbox-scheduler/config.yaml
+        volumeMounts:
+        - name: config
+          mountPath: /etc/sandbox-scheduler
+      volumes:
+      - name: config
+        configMap:
+          name: sandbox-scheduler-${i}
+EOF
+    done
+  } > "${SCHED_MANIFEST}"
+  export STRESS_EXTRA_MANIFESTS="${STRESS_EXTRA_MANIFESTS:-${SCHED_MANIFEST}}"
+  SCHEDULER_NAMES="default-scheduler"
+  for (( i = 1; i <= SCALEUP_EXTRA_SCHEDULERS; i++ )); do
+    SCHEDULER_NAMES="${SCHEDULER_NAMES},sandbox-scheduler-${i}"
+  done
+  # Disjoint node partitions, one per scheduler lane: independent
+  # schedulers racing over shared nodes overbooked them past maxPods
+  # within their watch lag (857 OutOfpods across 100k pods, first
+  # 5-scheduler run). The runner labels nodes round-robin; the harness
+  # pins each lane's sandboxes to its partition via nodeSelector.
+  export STRESS_NODE_PARTITIONS=$((SCALEUP_EXTRA_SCHEDULERS + 1))
+  SCHEDULER_NAMES_FLAG=" --scheduler-names=${SCHEDULER_NAMES} --scheduler-partition-label=scaleup-partition"
+  echo "External schedulers: ${SCALEUP_EXTRA_SCHEDULERS} x ${SCALEUP_SCHEDULER_IMAGE} (lanes: ${SCHEDULER_NAMES}, partitioned)"
+fi
+
 # --per-sandbox-timeout is the fill stall detector (no NEW Ready for that
 #   long aborts the run) -- generous because the Ready wave trails the
 #   create wave at this scale.
 # --cleanup=false: tearing down a 100k-sandbox namespace would add many
 #   minutes; the whole cluster is deleted on exit anyway.
-export STRESS_EXTRA_ARGS="${STRESS_EXTRA_ARGS:---client-connections=${CLIENT_CONNECTIONS} --per-sandbox-timeout=15m --cleanup=false}"
+# SCALEUP_FILL_RATE (sandboxes/s, optional): pace creation instead of
+# dumping. The apiserver ingests pod events through one serial loop per
+# resource (~5-6k events/s measured, ~4 events per pod); pacing at or
+# below that ceiling keeps end-to-end latency flat instead of building a
+# delivery backlog during the burst.
+export STRESS_EXTRA_ARGS="${STRESS_EXTRA_ARGS:---client-connections=${CLIENT_CONNECTIONS} --per-sandbox-timeout=15m --cleanup=false${SCHEDULER_NAMES_FLAG}${SCALEUP_FILL_RATE:+ --fill-create-rate=${SCALEUP_FILL_RATE}}}"
 export STRESS_TIMEOUT="${STRESS_TIMEOUT:-60m}"
 
 # Controller tuning: qps=2000 + 400 workers is the empirical optimum from
