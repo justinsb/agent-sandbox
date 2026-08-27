@@ -1,8 +1,8 @@
 module sigs.k8s.io/agent-sandbox
 
-go 1.26.0
+go 1.27.0
 
-toolchain go1.26.4
+toolchain go1.27.0
 
 require (
 	github.com/felixge/fgprof v0.9.5
