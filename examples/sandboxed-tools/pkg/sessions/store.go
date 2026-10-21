@@ -98,7 +98,7 @@ func (s *FileStore) ensureDir(sessionID string) error {
 
 // ListSessions lists the session directories under the base directory. A
 // directory counts as a session if it has metadata or a message history.
-func (s *FileStore) ListSessions(ctx context.Context) ([]string, error) {
+func (s *FileStore) ListSessions(_ context.Context) ([]string, error) {
 	entries, err := os.ReadDir(s.basedir)
 	if err != nil {
 		if os.IsNotExist(err) {
