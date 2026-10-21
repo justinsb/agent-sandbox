@@ -18,6 +18,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"sigs.k8s.io/agent-sandbox/examples/sandboxed-tools/pkg/agent"
 	"sigs.k8s.io/agent-sandbox/examples/sandboxed-tools/pkg/llm"
@@ -89,6 +90,74 @@ func TestSpawnChildSessionTool(t *testing.T) {
 		call.Function.Arguments = args
 		if _, err := registry.Call(ctx, noSandbox{}, call); err == nil {
 			t.Errorf("Call(%s) should fail", args)
+		}
+	}
+}
+
+func TestListAndDescribeSessionTools(t *testing.T) {
+	m := newTestManager(t)
+	registry := tools.NewRegistry()
+	New(m).RegisterTools(registry)
+	ctx := tools.WithCallerSession(context.Background(), "parent1")
+	call := func(name, args string) (string, error) {
+		msg, err := registry.Call(ctx, noSandbox{}, llm.ToolCall{ID: "c", Function: llm.FunctionCall{Name: name, Arguments: args}})
+		if err != nil {
+			return "", err
+		}
+		return *msg.Content, nil
+	}
+
+	out, err := call(ListChildSessionsToolName, "{}")
+	if err != nil || out != "No child sessions." {
+		t.Fatalf("list with no children = %q, %v", out, err)
+	}
+
+	childID, err := m.Spawn(ctx, "parent1", DefaultChildToolset, "Do the thing")
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	// Someone else's child must not show up or be describable.
+	otherID, err := m.Spawn(ctx, "parent2", DefaultChildToolset, "Other thing")
+	if err != nil {
+		t.Fatalf("Spawn (other): %v", err)
+	}
+	m.Get(childID).Messages() // wait for the child's turn to finish
+	m.Get(otherID).Messages()
+
+	out, err = call(ListChildSessionsToolName, "{}")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if !strings.Contains(out, childID+": toolset="+DefaultChildToolset+" state=idle for") || strings.Contains(out, otherID) {
+		t.Errorf("list = %q, want only %s, idle", out, childID)
+	}
+
+	out, err = call(DescribeSessionToolName, `{"session_id":"`+childID+`"}`)
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	for _, want := range []string{"Session: " + childID, "Toolset: " + DefaultChildToolset, "State: idle for", "Messages: 3", "Completed turns since loaded: 1", "Last reply:"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("describe = %q, want it to contain %q", out, want)
+		}
+	}
+
+	for _, args := range []string{`{"session_id":"` + otherID + `"}`, `{"session_id":"nosuch"}`, `{}`} {
+		if _, err := call(DescribeSessionToolName, args); err == nil {
+			t.Errorf("describe(%s) should fail", args)
+		}
+	}
+}
+
+func TestFormatAge(t *testing.T) {
+	for d, want := range map[time.Duration]string{
+		5 * time.Second:               "5s",
+		3 * time.Minute:               "3m",
+		2*time.Hour + 7*time.Minute:   "2h07m",
+		25*time.Hour + 30*time.Minute: "25h30m",
+	} {
+		if got := formatAge(d); got != want {
+			t.Errorf("formatAge(%v) = %q, want %q", d, got, want)
 		}
 	}
 }

@@ -163,3 +163,41 @@ func TestFileStoreMetadata(t *testing.T) {
 		t.Error("SaveMetadata with an invalid session name should fail")
 	}
 }
+
+func TestFileStoreListSessions(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store := NewFileStore(dir)
+
+	ids, err := store.ListSessions(ctx)
+	if err != nil || len(ids) != 0 {
+		t.Fatalf("ListSessions(empty) = %v, %v; want none", ids, err)
+	}
+
+	content := "hi"
+	if err := store.AppendMessages(ctx, "bhistory", llm.Message{Role: "user", Content: &content}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveMetadata(ctx, "ameta", Metadata{Toolset: "basic"}); err != nil {
+		t.Fatal(err)
+	}
+	// Neither a session: an empty directory, and a file.
+	if err := os.Mkdir(dir+"/empty", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/stray.txt", []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ids, err = store.ListSessions(ctx)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if diff := cmp.Diff([]string{"ameta", "bhistory"}, ids); diff != "" {
+		t.Errorf("ListSessions mismatch (-want +got):\n%s", diff)
+	}
+
+	if ids, err := NewFileStore(dir + "/does-not-exist").ListSessions(ctx); err != nil || len(ids) != 0 {
+		t.Errorf("ListSessions(missing basedir) = %v, %v; want none", ids, err)
+	}
+}

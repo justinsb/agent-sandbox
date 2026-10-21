@@ -68,6 +68,9 @@ type Store interface {
 	// SaveMetadata persists the session's metadata, replacing any previous
 	// metadata.
 	SaveMetadata(ctx context.Context, sessionID string, metadata Metadata) error
+
+	// ListSessions returns the IDs of all persisted sessions, sorted.
+	ListSessions(ctx context.Context) ([]string, error)
 }
 
 // FileStore is a JSONL implementation of the Store interface.
@@ -91,6 +94,34 @@ func (s *FileStore) ensureDir(sessionID string) error {
 		return fmt.Errorf("failed to create session directory %s: %w", dir, err)
 	}
 	return nil
+}
+
+// ListSessions lists the session directories under the base directory. A
+// directory counts as a session if it has metadata or a message history.
+func (s *FileStore) ListSessions(ctx context.Context) ([]string, error) {
+	entries, err := os.ReadDir(s.basedir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to list sessions in %s: %w", s.basedir, err)
+	}
+	var ids []string
+	for _, entry := range entries {
+		id := entry.Name()
+		if !entry.IsDir() || ValidateSessionName(id) != nil {
+			continue
+		}
+		if _, err := os.Stat(s.metadataPath(id)); err == nil {
+			ids = append(ids, id)
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(s.basedir, id, "sessions", "latest.jsonl")); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	// ReadDir returns entries sorted by name already.
+	return ids, nil
 }
 
 // metadataPath is the session's metadata file, a sibling of the sessions/

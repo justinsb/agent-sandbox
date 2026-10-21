@@ -21,6 +21,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"k8s.io/klog/v2"
 
@@ -31,6 +32,10 @@ import (
 // ErrSessionBusy is returned by ManagedSession.RunTurn when the session is
 // already processing a turn.
 var ErrSessionBusy = errors.New("session is already processing a turn")
+
+// ErrNotChild is returned by Manager methods that act on a session on behalf
+// of another when the target is not a child of the acting session.
+var ErrNotChild = errors.New("session is not a child of the calling session")
 
 // Manager owns the sessions of a long-running front end such as the ACP
 // server. It keeps a single in-memory Session per session ID (so that
@@ -192,6 +197,100 @@ func (m *Manager) Spawn(ctx context.Context, parent, toolset, prompt string) (st
 	return childID, nil
 }
 
+// SessionInfo describes a session for a supervising session: its identity
+// and metadata, and its current state if it is loaded.
+type SessionInfo struct {
+	ID       string
+	Metadata sessions.Metadata
+	// Loaded reports whether the session is loaded in this Manager; State is
+	// only meaningful if it is. A session that is not loaded (for example
+	// one created before the server restarted) is idle by definition.
+	Loaded bool
+	State  SessionState
+	// MessageCount is the number of messages in the session's transcript,
+	// including the system prompt.
+	MessageCount int
+}
+
+// Children returns the sessions whose recorded parent is parent, sorted by
+// ID. It consults the store, so children from before a restart are
+// included; those are reported as not loaded.
+func (m *Manager) Children(ctx context.Context, parent string) ([]SessionInfo, error) {
+	ids, err := m.store.ListSessions(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing sessions: %w", err)
+	}
+	var children []SessionInfo
+	for _, id := range ids {
+		metadata, err := m.store.LoadMetadata(ctx, id)
+		if err != nil {
+			if errors.Is(err, sessions.ErrNotFound) {
+				continue // predates metadata, so it has no parent
+			}
+			return nil, fmt.Errorf("loading metadata of session %q: %w", id, err)
+		}
+		if metadata.Parent != parent {
+			continue
+		}
+		info, err := m.describe(ctx, id, *metadata)
+		if err != nil {
+			return nil, err
+		}
+		children = append(children, *info)
+	}
+	return children, nil
+}
+
+// Describe returns the state of sessionID on behalf of caller, which must be
+// its parent (ErrNotChild otherwise): a session may only inspect the
+// sessions it spawned.
+func (m *Manager) Describe(ctx context.Context, caller, sessionID string) (*SessionInfo, error) {
+	metadata, err := m.childMetadata(ctx, caller, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return m.describe(ctx, sessionID, *metadata)
+}
+
+// childMetadata loads sessionID's metadata, checking that caller is its
+// parent.
+func (m *Manager) childMetadata(ctx context.Context, caller, sessionID string) (*sessions.Metadata, error) {
+	if err := sessions.ValidateSessionName(sessionID); err != nil {
+		return nil, fmt.Errorf("invalid session ID %q: %w", sessionID, err)
+	}
+	metadata, err := m.store.LoadMetadata(ctx, sessionID)
+	if err != nil {
+		if errors.Is(err, sessions.ErrNotFound) {
+			// Unknown sessions and sessions without metadata look the same
+			// to the caller: neither is one of its children.
+			return nil, fmt.Errorf("session %q: %w", sessionID, ErrNotChild)
+		}
+		return nil, fmt.Errorf("loading metadata of session %q: %w", sessionID, err)
+	}
+	if caller == "" || metadata.Parent != caller {
+		return nil, fmt.Errorf("session %q: %w", sessionID, ErrNotChild)
+	}
+	return metadata, nil
+}
+
+func (m *Manager) describe(ctx context.Context, sessionID string, metadata sessions.Metadata) (*SessionInfo, error) {
+	info := &SessionInfo{ID: sessionID, Metadata: metadata}
+	if active := m.Get(sessionID); active != nil {
+		info.Loaded = true
+		info.State = active.State()
+		// Count without waiting for a running turn: the transcript length is
+		// informational.
+		info.MessageCount = len(active.Session.Messages())
+		return info, nil
+	}
+	messages, err := m.store.LoadSession(ctx, sessionID)
+	if err != nil && !errors.Is(err, sessions.ErrNotFound) {
+		return nil, fmt.Errorf("loading session %q: %w", sessionID, err)
+	}
+	info.MessageCount = len(messages)
+	return info, nil
+}
+
 // autonomousEvents drives a turn that no one is watching: tool calls are
 // approved, and the outcome is only logged.
 type autonomousEvents struct{}
@@ -216,6 +315,112 @@ type ManagedSession struct {
 
 	harness *Harness
 	turnMu  sync.Mutex
+
+	// stateMu guards state, which is updated by the running turn and read
+	// by whoever is describing the session.
+	stateMu sync.Mutex
+	state   SessionState
+}
+
+// SessionState is what a session is doing right now and what it did last,
+// as observed by the Manager; it is not persisted.
+type SessionState struct {
+	// Running reports whether a turn is in progress.
+	Running bool
+	// TurnStartedAt is when the current turn started, if Running.
+	TurnStartedAt time.Time
+	// CurrentTool is the tool executing right now, if any, and
+	// ToolStartedAt when it started.
+	CurrentTool   string
+	ToolStartedAt time.Time
+
+	// LastActivityAt is when the session last did anything: a turn or tool
+	// call starting or finishing. Zero if nothing happened since it was
+	// loaded.
+	LastActivityAt time.Time
+	// LastAssistantMessage is the assistant's most recent final reply.
+	LastAssistantMessage string
+	// LastError is the error that ended the most recent turn, or "" if it
+	// ended normally.
+	LastError string
+	// CompletedTurns counts the turns that have ended since the session was
+	// loaded, successfully or not.
+	CompletedTurns int
+}
+
+// State returns a snapshot of the session's state.
+func (s *ManagedSession) State() SessionState {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.state
+}
+
+func (s *ManagedSession) updateState(update func(state *SessionState)) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	update(&s.state)
+}
+
+// trackedTurn runs one turn with the session's harness, recording its
+// progress in the session state. The caller holds turnMu.
+func (s *ManagedSession) trackedTurn(ctx context.Context, input string, events TurnEvents) error {
+	now := time.Now()
+	s.updateState(func(state *SessionState) {
+		state.Running = true
+		state.TurnStartedAt = now
+		state.LastActivityAt = now
+		state.LastError = ""
+	})
+	err := s.harness.RunTurn(ctx, s.Session, input, &trackingEvents{session: s, events: events})
+	s.updateState(func(state *SessionState) {
+		state.Running = false
+		state.TurnStartedAt = time.Time{}
+		state.CurrentTool = ""
+		state.ToolStartedAt = time.Time{}
+		state.LastActivityAt = time.Now()
+		state.CompletedTurns++
+		if err != nil {
+			state.LastError = err.Error()
+		}
+	})
+	return err
+}
+
+// trackingEvents records a turn's progress in the session state before
+// passing each event on.
+type trackingEvents struct {
+	session *ManagedSession
+	events  TurnEvents
+}
+
+func (e *trackingEvents) AssistantMessage(ctx context.Context, text string) {
+	e.session.updateState(func(state *SessionState) {
+		state.LastAssistantMessage = text
+		state.LastActivityAt = time.Now()
+	})
+	e.events.AssistantMessage(ctx, text)
+}
+
+func (e *trackingEvents) ApproveToolCall(ctx context.Context, call llm.ToolCall) (bool, error) {
+	return e.events.ApproveToolCall(ctx, call)
+}
+
+func (e *trackingEvents) ToolCallStarted(ctx context.Context, call llm.ToolCall) {
+	e.session.updateState(func(state *SessionState) {
+		state.CurrentTool = call.Function.Name
+		state.ToolStartedAt = time.Now()
+		state.LastActivityAt = state.ToolStartedAt
+	})
+	e.events.ToolCallStarted(ctx, call)
+}
+
+func (e *trackingEvents) ToolCallFinished(ctx context.Context, call llm.ToolCall, err error) {
+	e.session.updateState(func(state *SessionState) {
+		state.CurrentTool = ""
+		state.ToolStartedAt = time.Time{}
+		state.LastActivityAt = time.Now()
+	})
+	e.events.ToolCallFinished(ctx, call, err)
 }
 
 // RunTurn processes one user message with the session's harness (see
@@ -227,7 +432,7 @@ func (s *ManagedSession) RunTurn(ctx context.Context, input string, events TurnE
 		return ErrSessionBusy
 	}
 	defer s.turnMu.Unlock()
-	return s.harness.RunTurn(ctx, s.Session, input, events)
+	return s.trackedTurn(ctx, input, events)
 }
 
 // RunTurnDetached starts a turn in the background and returns once it has
@@ -241,7 +446,7 @@ func (s *ManagedSession) RunTurnDetached(ctx context.Context, input string, even
 	sessionName := s.Session.Name
 	go func() {
 		defer s.turnMu.Unlock()
-		if err := s.harness.RunTurn(ctx, s.Session, input, events); err != nil {
+		if err := s.trackedTurn(ctx, input, events); err != nil {
 			klog.FromContext(ctx).Error(err, "detached turn failed", "session", sessionName)
 		}
 	}()

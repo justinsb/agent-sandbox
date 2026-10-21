@@ -17,6 +17,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -205,5 +206,107 @@ func TestManagerSpawn(t *testing.T) {
 	}
 	if _, err := m.Spawn(ctx, "Not Valid", "basic", "x"); err == nil {
 		t.Error("Spawn with an invalid parent name should fail")
+	}
+}
+
+func TestManagerChildrenAndDescribe(t *testing.T) {
+	ctx := t.Context()
+	m, harnesses := newTestManager(t, &llm.ElizaClient{})
+
+	// A top-level session, two children of it, and a child of someone else.
+	if _, err := m.Open(ctx, "parent1", OpenOptions{Metadata: sessions.Metadata{Toolset: "basic"}}); err != nil {
+		t.Fatal(err)
+	}
+	child1, err := m.Spawn(ctx, "parent1", "geminicli", "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	child2, err := m.Spawn(ctx, "parent1", "basic", "two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Spawn(ctx, "parent2", "basic", "three"); err != nil {
+		t.Fatal(err)
+	}
+	m.Get(child1).Messages() // wait for the detached turns
+	m.Get(child2).Messages()
+
+	children, err := m.Children(ctx, "parent1")
+	if err != nil {
+		t.Fatalf("Children: %v", err)
+	}
+	var ids []string
+	for _, c := range children {
+		ids = append(ids, c.ID)
+		if !c.Loaded || c.State.Running || c.State.CompletedTurns != 1 || c.MessageCount != 3 || c.State.LastAssistantMessage == "" {
+			t.Errorf("child %s info = %+v, want loaded, idle, one completed turn, 3 messages, a last reply", c.ID, c)
+		}
+	}
+	want := []string{child1, child2}
+	slices.Sort(want)
+	if !slices.Equal(ids, want) {
+		t.Errorf("Children(parent1) = %v, want %v", ids, want)
+	}
+
+	info, err := m.Describe(ctx, "parent1", child1)
+	if err != nil {
+		t.Fatalf("Describe: %v", err)
+	}
+	if info.Metadata.Toolset != "geminicli" || info.Metadata.Parent != "parent1" {
+		t.Errorf("Describe metadata = %+v", info.Metadata)
+	}
+
+	// Only the parent may describe a child.
+	if _, err := m.Describe(ctx, "parent2", child1); !errors.Is(err, ErrNotChild) {
+		t.Errorf("Describe by non-parent err = %v, want ErrNotChild", err)
+	}
+	if _, err := m.Describe(ctx, "parent1", "nosuch"); !errors.Is(err, ErrNotChild) {
+		t.Errorf("Describe unknown err = %v, want ErrNotChild", err)
+	}
+	if _, err := m.Describe(ctx, "", child1); !errors.Is(err, ErrNotChild) {
+		t.Errorf("Describe without caller err = %v, want ErrNotChild", err)
+	}
+
+	// After a restart the child is known from the store but not loaded.
+	m2 := NewManager(ctx, m.store)
+	for name, h := range harnesses {
+		m2.AddToolset(name, h)
+	}
+	info, err = m2.Describe(ctx, "parent1", child1)
+	if err != nil {
+		t.Fatalf("Describe (after restart): %v", err)
+	}
+	if info.Loaded || info.MessageCount != 3 {
+		t.Errorf("Describe after restart = %+v, want not loaded with 3 messages", info)
+	}
+}
+
+func TestManagedSessionState_TracksRunningTurn(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	llmClient := &blockingLLM{started: make(chan struct{})}
+	m, _ := newTestManager(t, llmClient)
+
+	s, err := m.Open(ctx, "s1", OpenOptions{Metadata: sessions.Metadata{Toolset: "basic"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state := s.State(); state.Running || !state.LastActivityAt.IsZero() {
+		t.Errorf("initial state = %+v, want idle with no activity", state)
+	}
+
+	if err := s.RunTurnDetached(ctx, "hello", silentEvents{}); err != nil {
+		t.Fatal(err)
+	}
+	<-llmClient.started
+	if state := s.State(); !state.Running || state.TurnStartedAt.IsZero() || state.CurrentTool != "" {
+		t.Errorf("state during turn = %+v, want running, no tool", state)
+	}
+
+	cancel()
+	s.Messages() // wait for the turn to end
+	state := s.State()
+	if state.Running || state.CompletedTurns != 1 || state.LastError == "" || state.LastActivityAt.IsZero() {
+		t.Errorf("state after failed turn = %+v, want idle, one completed turn, an error", state)
 	}
 }
