@@ -32,6 +32,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -45,6 +46,7 @@ import (
 	"sigs.k8s.io/agent-sandbox/examples/sandboxed-tools/pkg/toolsets"
 	"sigs.k8s.io/agent-sandbox/examples/sandboxed-tools/pkg/toolsets/geminicli"
 	"sigs.k8s.io/agent-sandbox/examples/sandboxed-tools/pkg/toolsets/geminicli/toolbox"
+	"sigs.k8s.io/agent-sandbox/examples/sandboxed-tools/pkg/toolsets/supervisor"
 )
 
 func main() {
@@ -63,7 +65,7 @@ func main() {
 	flag.StringVar(&opts.Namespace, "namespace", opts.Namespace, "namespace for sandbox pods")
 	flag.StringVar(&opts.Image, "image", opts.Image, "Sandbox container image; if empty, uses the toolset's default image.")
 	flag.StringVar(&opts.HomeDir, "homedir", opts.HomeDir, "Home directory in the sandbox; this is currently the only directory that we persist with snapshot/restore.")
-	flag.StringVar(&toolsetName, "toolset", toolsetName, fmt.Sprintf("Toolset (tools + system prompt) for sessions created over ACP (a resumed session keeps its recorded toolset); one of: %s", strings.Join(toolsets.Names(), ", ")))
+	flag.StringVar(&toolsetName, "toolset", toolsetName, fmt.Sprintf("Toolset (tools + system prompt) for sessions created over ACP (a resumed session keeps its recorded toolset); one of: %s", strings.Join(append(toolsets.Names(), supervisor.Name), ", ")))
 	flag.DurationVar(&opts.ToolTimeout, "tool-timeout", opts.ToolTimeout, "Maximum duration a single tool invocation may run before it is cancelled. <= 0 disables the timeout.")
 	flag.Parse()
 
@@ -75,13 +77,6 @@ func main() {
 
 func run(ctx context.Context, opts agent.RunOptions, toolsetName string, listen string) error {
 	log := klog.FromContext(ctx)
-
-	// The default toolset is for sessions created over ACP; every toolset is
-	// available so that a resumed session can run with the one it recorded.
-	defaultToolset, err := toolsets.Get(toolsetName)
-	if err != nil {
-		return err
-	}
 
 	llmClient, err := llm.NewFromEnv(opts.ModelName)
 	if err != nil {
@@ -115,7 +110,10 @@ func run(ctx context.Context, opts agent.RunOptions, toolsetName string, listen 
 	// for the plan to externalize it).
 	sessionStore := sessions.NewFileStore(filepath.Join(homeDir, ".local", "sandboxed-tools"))
 
-	manager := agent.NewManager(sessionStore)
+	// Every toolset is available, so that a resumed session can run with the
+	// one it recorded and a supervisor can spawn children of any toolset;
+	// the default toolset is for sessions created over ACP.
+	manager := agent.NewManager(ctx, sessionStore)
 	for _, name := range toolsets.Names() {
 		toolset, err := toolsets.Get(name)
 		if err != nil {
@@ -123,13 +121,24 @@ func run(ctx context.Context, opts agent.RunOptions, toolsetName string, listen 
 		}
 		manager.AddToolset(name, newHarness(ctx, toolset, llmClient, sandboxClient, opts))
 	}
+	// The supervisor acts on other sessions through the manager, so it is
+	// built here rather than by toolsets.Get.
+	manager.AddToolset(supervisor.Name, newHarness(ctx, supervisor.New(manager), llmClient, sandboxClient, opts))
+
+	defaultToolset := toolsetName
+	if defaultToolset == "" {
+		defaultToolset = "basic"
+	}
+	if !slices.Contains(manager.Toolsets(), defaultToolset) {
+		return fmt.Errorf("unknown toolset %q (available: %s)", defaultToolset, strings.Join(manager.Toolsets(), ", "))
+	}
 
 	listener, err := net.Listen("tcp", listen)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", listen, err)
 	}
 	defer listener.Close()
-	log.Info("serving ACP", "address", listener.Addr().String(), "model", opts.ModelName, "defaultToolset", defaultToolset.Name())
+	log.Info("serving ACP", "address", listener.Addr().String(), "model", opts.ModelName, "defaultToolset", defaultToolset)
 
 	// Close the listener on shutdown so Accept returns.
 	go func() {
@@ -148,7 +157,7 @@ func run(ctx context.Context, opts agent.RunOptions, toolsetName string, listen 
 		log.Info("client connected", "remote", conn.RemoteAddr().String())
 		go func() {
 			defer conn.Close()
-			serveConn(ctx, manager, defaultToolset.Name(), conn)
+			serveConn(ctx, manager, defaultToolset, conn)
 			log.Info("client disconnected", "remote", conn.RemoteAddr().String())
 		}()
 	}

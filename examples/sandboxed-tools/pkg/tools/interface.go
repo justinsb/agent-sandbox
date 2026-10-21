@@ -24,7 +24,28 @@ import (
 // Tool is the interface for all LLM-callable tools.
 type Tool interface {
 	Schema() llm.Tool
+	// Run executes the tool in the sandbox of the calling session. The
+	// calling session's name is available from CallerSession(ctx) for tools
+	// that act on sessions rather than on the sandbox.
 	Run(ctx context.Context, sandbox Sandbox) (llm.Message, error)
+}
+
+// callerSessionKey is the context key under which the agent loop records the
+// name of the session a tool is being invoked from.
+type callerSessionKey struct{}
+
+// WithCallerSession returns a context that records sessionName as the
+// session whose turn is invoking tools; the agent loop sets it before
+// running a tool call.
+func WithCallerSession(ctx context.Context, sessionName string) context.Context {
+	return context.WithValue(ctx, callerSessionKey{}, sessionName)
+}
+
+// CallerSession returns the name of the session invoking the tool, or "" if
+// the tool is not running inside a session's turn.
+func CallerSession(ctx context.Context) string {
+	name, _ := ctx.Value(callerSessionKey{}).(string)
+	return name
 }
 
 // Sandbox represents the interface for running commands in a sandbox.

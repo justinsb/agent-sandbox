@@ -838,7 +838,7 @@ func (h *Harness) RunTurn(ctx context.Context, session *Session, input string, e
 				}
 
 				events.ToolCallStarted(ctx, tc)
-				result, err := h.toolsRegistry.Call(ctx, sandbox, tc)
+				result, err := h.toolsRegistry.Call(tools.WithCallerSession(ctx, session.Name), sandbox, tc)
 				events.ToolCallFinished(ctx, tc, err)
 
 				// The filesystem may have changed (even on error), so

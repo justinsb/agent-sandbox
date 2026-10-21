@@ -43,7 +43,11 @@ func NewRegistry() *Registry {
 	}
 }
 
-// Add registers a new tool.
+// Add registers a new tool. The registered value is a prototype: each
+// invocation runs on a copy of it with the LLM's arguments unmarshalled on
+// top, so fields the prototype carries (dependencies such as clients, in
+// unexported or json:"-" fields) are available to Run while argument fields
+// start from the prototype's values.
 func (r *Registry) Add(tool Tool) {
 	if tool == nil {
 		panic("registered tool must not be nil")
@@ -97,8 +101,12 @@ func (r *Registry) Call(ctx context.Context, sandbox Sandbox, tc llm.ToolCall) (
 		return llm.Message{}, fmt.Errorf("tool %q not found", tc.Function.Name)
 	}
 
-	toolType := reflect.TypeOf(tool).Elem()
-	toolInvocation := reflect.New(toolType).Interface().(Tool)
+	// Copy the prototype (see Add) rather than starting from a zero value, so
+	// that dependencies set on the registered tool carry over to the call.
+	prototype := reflect.ValueOf(tool).Elem()
+	invocation := reflect.New(prototype.Type())
+	invocation.Elem().Set(prototype)
+	toolInvocation := invocation.Interface().(Tool)
 
 	if err := json.Unmarshal([]byte(tc.Function.Arguments), toolInvocation); err != nil {
 		return llm.Message{}, fmt.Errorf("failed to parse arguments: %w", err)

@@ -22,6 +22,8 @@ import (
 	"strings"
 	"sync"
 
+	"k8s.io/klog/v2"
+
 	"sigs.k8s.io/agent-sandbox/examples/sandboxed-tools/pkg/llm"
 	"sigs.k8s.io/agent-sandbox/examples/sandboxed-tools/pkg/sessions"
 )
@@ -46,6 +48,11 @@ var ErrSessionBusy = errors.New("session is already processing a turn")
 type Manager struct {
 	store sessions.Store
 
+	// ctx bounds the turns the Manager runs on its own behalf (child
+	// sessions' turns, which no client connection is waiting on); it is the
+	// lifetime of the owning server.
+	ctx context.Context
+
 	// mu guards harnesses and sessions. It is held across Open's build so
 	// that two concurrent opens cannot produce two Session objects for one
 	// session ID.
@@ -54,11 +61,14 @@ type Manager struct {
 	sessions  map[string]*ManagedSession
 }
 
-// NewManager creates a Manager whose sessions are persisted in store. Call
-// AddToolset for each toolset sessions may run with before opening any.
-func NewManager(store sessions.Store) *Manager {
+// NewManager creates a Manager whose sessions are persisted in store. ctx
+// is the lifetime of the server: it bounds the turns the Manager runs in the
+// background for child sessions. Call AddToolset for each toolset sessions
+// may run with before opening any.
+func NewManager(ctx context.Context, store sessions.Store) *Manager {
 	return &Manager{
 		store:     store,
+		ctx:       ctx,
 		harnesses: make(map[string]*Harness),
 		sessions:  make(map[string]*ManagedSession),
 	}
@@ -157,6 +167,47 @@ func (m *Manager) Get(sessionID string) *ManagedSession {
 	return m.sessions[sessionID]
 }
 
+// Spawn creates a new session of the given toolset as a child of the parent
+// session and starts it on prompt in the background, returning the child's
+// ID as soon as the session exists. The child runs autonomously: its turn is
+// not tied to any client connection and its tool calls are approved without
+// asking anyone.
+func (m *Manager) Spawn(ctx context.Context, parent, toolset, prompt string) (string, error) {
+	if err := sessions.ValidateSessionName(parent); err != nil {
+		return "", fmt.Errorf("invalid parent session name %q: %w", parent, err)
+	}
+	childID, err := sessions.NewSessionID("child")
+	if err != nil {
+		return "", err
+	}
+	child, err := m.Open(ctx, childID, OpenOptions{Metadata: sessions.Metadata{Parent: parent, Toolset: toolset}})
+	if err != nil {
+		return "", fmt.Errorf("creating child session: %w", err)
+	}
+	klog.FromContext(ctx).Info("spawned child session", "session", childID, "parent", parent, "toolset", toolset)
+
+	if err := child.RunTurnDetached(m.ctx, prompt, autonomousEvents{}); err != nil {
+		return "", fmt.Errorf("starting child session %q: %w", childID, err)
+	}
+	return childID, nil
+}
+
+// autonomousEvents drives a turn that no one is watching: tool calls are
+// approved, and the outcome is only logged.
+type autonomousEvents struct{}
+
+func (autonomousEvents) AssistantMessage(ctx context.Context, text string) {
+	klog.FromContext(ctx).V(1).Info("assistant message", "text", text)
+}
+
+func (autonomousEvents) ApproveToolCall(context.Context, llm.ToolCall) (bool, error) {
+	return true, nil
+}
+
+func (autonomousEvents) ToolCallStarted(context.Context, llm.ToolCall) {}
+
+func (autonomousEvents) ToolCallFinished(context.Context, llm.ToolCall, error) {}
+
 // ManagedSession is a session loaded in a Manager. Session and
 // Harness.RunTurn are not safe for concurrent use, while front ends dispatch
 // requests concurrently, so turnMu serializes access to the session.
@@ -177,6 +228,24 @@ func (s *ManagedSession) RunTurn(ctx context.Context, input string, events TurnE
 	}
 	defer s.turnMu.Unlock()
 	return s.harness.RunTurn(ctx, s.Session, input, events)
+}
+
+// RunTurnDetached starts a turn in the background and returns once it has
+// started, or ErrSessionBusy if a turn is already in progress. The turn runs
+// under ctx (which should outlive the caller, e.g. the server's lifetime);
+// its error, if any, is logged rather than returned.
+func (s *ManagedSession) RunTurnDetached(ctx context.Context, input string, events TurnEvents) error {
+	if !s.turnMu.TryLock() {
+		return ErrSessionBusy
+	}
+	sessionName := s.Session.Name
+	go func() {
+		defer s.turnMu.Unlock()
+		if err := s.harness.RunTurn(ctx, s.Session, input, events); err != nil {
+			klog.FromContext(ctx).Error(err, "detached turn failed", "session", sessionName)
+		}
+	}()
+	return nil
 }
 
 // Messages returns a copy of the session's messages, waiting for a turn in

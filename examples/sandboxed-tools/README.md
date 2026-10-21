@@ -7,7 +7,7 @@ By reusing a sandbox and automatically extending its inactivity timeout, we avoi
 ## Architecture & Key Concepts
 
 1. **Minimal OpenAI-Compatible Client (`pkg/llm`)**: A lightweight Go client built on `net/http` without a third-party OpenAI SDK that interacts with OpenAI-compatible API endpoints (such as the Gemini API via its OpenAI compatibility layer). It supports function calling (tools) and tool call responses.
-2. **Pluggable Toolsets (`pkg/toolsets`)**: The tools and the system prompt are bundled into a *toolset*, selected with the `-toolset` flag. A toolset also declares the sandbox image it expects, so switching toolsets switches the whole agent profile. Two toolsets are provided: `basic` (the original minimal tools) and `geminicli` (the [gemini-cli](https://github.com/google-gemini/gemini-cli) tool surface, reimplemented in Go — see below).
+2. **Pluggable Toolsets (`pkg/toolsets`)**: The tools and the system prompt are bundled into a *toolset*, selected with the `-toolset` flag. A toolset also declares the sandbox image it expects, so switching toolsets switches the whole agent profile. Three toolsets are provided: `basic` (the original minimal tools), `geminicli` (the [gemini-cli](https://github.com/google-gemini/gemini-cli) tool surface, reimplemented in Go — see below), and `supervisor` (a session that delegates to child sessions; ACP server only).
 3. **Sandbox Reuse**: The application provisions a sandbox pod on the first tool call of a session, and reuses it for subsequent tool calls. This keeps the execution overhead low.
 4. **Session Persistence via Snapshots**: To maintain continuity across conversation turns and protect against inactivity cleanups or CLI restarts:
    - The application automatically snapshots the sandbox's home directory (`/home/clawtainer` by default) after tool executions at conversation boundaries.
@@ -81,6 +81,12 @@ kind load docker-image kind.local/geminicli-toolbox:dev --name agent-sandbox
 cd examples/sandboxed-tools
 go run ./cmd/sandboxed-tools-cli -session mysession -toolset geminicli -image kind.local/geminicli-toolbox:dev
 ```
+
+### `supervisor` (ACP server only)
+
+A toolset (`pkg/toolsets/supervisor`) for a session that coordinates other sessions instead of doing the work itself. It is only available in the ACP server (`TOOLSET=supervisor`), because it acts on sessions through the server's session manager; the single-session CLI cannot run it.
+
+* **`spawn_child_session`**: Creates a new session as a *child* of the calling session, with its own toolset (`geminicli` by default) and its own sandbox, and sends it an initial prompt. The call returns the child's session ID immediately; the child then works autonomously in the background, approving its own tool calls. The child's `metadata.json` records the parent, and any ACP client can `session/load` the child's ID to watch it.
 
 ## Fake LLM for Testing
 

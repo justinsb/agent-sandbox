@@ -51,7 +51,7 @@ func newTestManager(t *testing.T, llmClient llm.ChatClient) (*Manager, map[strin
 	t.Helper()
 	// Sessions snapshot under $HOME; keep the test off the real home directory.
 	t.Setenv("HOME", t.TempDir())
-	m := NewManager(sessions.NewFileStore(t.TempDir()))
+	m := NewManager(t.Context(), sessions.NewFileStore(t.TempDir()))
 	harnesses := map[string]*Harness{}
 	for _, name := range []string{"basic", "geminicli"} {
 		h := NewHarness(llmClient, nil, tools.NewRegistry(), RunOptions{Namespace: "ns", HomeDir: "/home/x", SystemPrompt: "You are " + name})
@@ -105,7 +105,7 @@ func TestManagerOpen_ResumeKeepsRecordedToolset(t *testing.T) {
 
 	// A fresh Manager over the same store (as after a restart) resumes the
 	// session with its recorded toolset, not the caller's default.
-	m2 := NewManager(m.store)
+	m2 := NewManager(ctx, m.store)
 	for name, h := range harnesses {
 		m2.AddToolset(name, h)
 	}
@@ -170,5 +170,40 @@ func TestManagedSessionRunTurn_Busy(t *testing.T) {
 	// fails only because the context is cancelled, not because it is busy).
 	if err := s.RunTurn(ctx, "after", silentEvents{}); errors.Is(err, ErrSessionBusy) {
 		t.Error("RunTurn after the turn ended should not be busy")
+	}
+}
+
+func TestManagerSpawn(t *testing.T) {
+	ctx := t.Context()
+	m, _ := newTestManager(t, &llm.ElizaClient{})
+
+	childID, err := m.Spawn(ctx, "parent1", "geminicli", "Say hello")
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if err := sessions.ValidateSessionName(childID); err != nil {
+		t.Errorf("child ID %q is not a valid session name: %v", childID, err)
+	}
+
+	child := m.Get(childID)
+	if child == nil {
+		t.Fatal("spawned child is not loaded in the manager")
+	}
+	if md := child.Session.Metadata; md.Parent != "parent1" || md.Toolset != "geminicli" {
+		t.Errorf("child metadata = %+v, want parent parent1, toolset geminicli", md)
+	}
+
+	// Messages waits for the detached turn to finish: the initial prompt
+	// and the (fake) assistant's reply are then in the transcript.
+	msgs := child.Messages()
+	if len(msgs) != 3 || msgs[1].Role != "user" || *msgs[1].Content != "Say hello" || msgs[2].Role != "assistant" {
+		t.Errorf("child transcript = %+v, want system prompt, the initial prompt, and a reply", msgs)
+	}
+
+	if _, err := m.Spawn(ctx, "parent1", "nosuchtoolset", "x"); err == nil {
+		t.Error("Spawn with an unknown toolset should fail")
+	}
+	if _, err := m.Spawn(ctx, "Not Valid", "basic", "x"); err == nil {
+		t.Error("Spawn with an invalid parent name should fail")
 	}
 }

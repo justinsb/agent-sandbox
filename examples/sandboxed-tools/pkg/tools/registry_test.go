@@ -379,3 +379,50 @@ func panicString(v any) string {
 	}
 	return ""
 }
+
+// dependentTool is a tool whose registered prototype carries a dependency
+// (dep) alongside its LLM-supplied argument (Arg).
+type dependentTool struct {
+	Arg string `json:"arg"`
+
+	dep *string
+}
+
+func (t *dependentTool) Schema() llm.Tool {
+	return llm.Tool{Type: "function", Function: llm.ToolFunction{Name: "dependent"}}
+}
+
+func (t *dependentTool) Run(ctx context.Context, _ Sandbox) (llm.Message, error) {
+	if t.dep == nil {
+		return llm.Message{}, errors.New("dependency not set")
+	}
+	content := *t.dep + ":" + t.Arg + ":" + CallerSession(ctx)
+	return llm.Message{Content: &content}, nil
+}
+
+func TestRegistryCall_CopiesPrototypeAndPassesCallerSession(t *testing.T) {
+	r := NewRegistry()
+	dep := "dep"
+	proto := &dependentTool{Arg: "default", dep: &dep}
+	r.Add(proto)
+
+	ctx := WithCallerSession(context.Background(), "parent1")
+	msg, err := r.Call(ctx, &fakeSandbox{}, llm.ToolCall{
+		ID:       "call_1",
+		Function: llm.FunctionCall{Name: "dependent", Arguments: `{"arg":"x"}`},
+	})
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if got := *msg.Content; got != "dep:x:parent1" {
+		t.Errorf("content = %q, want the dependency, the argument and the caller session", got)
+	}
+	// The prototype itself is untouched by the call's arguments.
+	if proto.Arg != "default" {
+		t.Errorf("prototype Arg = %q, want unchanged default", proto.Arg)
+	}
+
+	if got := CallerSession(context.Background()); got != "" {
+		t.Errorf("CallerSession without a session = %q, want empty", got)
+	}
+}
