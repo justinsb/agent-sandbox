@@ -190,7 +190,9 @@ Agent Sandboxes. Any other variable from the [Configuration](#configuration) tab
 same Secret, for example `OPENAI_BASE_URL` for a different OpenAI-compatible endpoint, or
 `TOOLSET=geminicli` together with `SANDBOX_IMAGE` pointing at an image that contains
 `geminicli-toolbox` (see [Toolsets](#toolsets)). Sandboxes are created in the namespace the
-server runs in.
+server runs in. `TOOLSET` only chooses the toolset for sessions created over ACP: the server
+loads every toolset, and a resumed session (`session/load`) runs with the toolset recorded in
+its metadata, so changing `TOOLSET` does not change existing sessions.
 
 ## Running the Example
 

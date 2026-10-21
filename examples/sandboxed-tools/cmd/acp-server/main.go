@@ -24,7 +24,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -34,7 +33,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 
 	"k8s.io/klog/v2"
@@ -65,7 +63,7 @@ func main() {
 	flag.StringVar(&opts.Namespace, "namespace", opts.Namespace, "namespace for sandbox pods")
 	flag.StringVar(&opts.Image, "image", opts.Image, "Sandbox container image; if empty, uses the toolset's default image.")
 	flag.StringVar(&opts.HomeDir, "homedir", opts.HomeDir, "Home directory in the sandbox; this is currently the only directory that we persist with snapshot/restore.")
-	flag.StringVar(&toolsetName, "toolset", toolsetName, fmt.Sprintf("Toolset (tools + system prompt) to expose to the LLM; one of: %s", strings.Join(toolsets.Names(), ", ")))
+	flag.StringVar(&toolsetName, "toolset", toolsetName, fmt.Sprintf("Toolset (tools + system prompt) for sessions created over ACP (a resumed session keeps its recorded toolset); one of: %s", strings.Join(toolsets.Names(), ", ")))
 	flag.DurationVar(&opts.ToolTimeout, "tool-timeout", opts.ToolTimeout, "Maximum duration a single tool invocation may run before it is cancelled. <= 0 disables the timeout.")
 	flag.Parse()
 
@@ -78,19 +76,11 @@ func main() {
 func run(ctx context.Context, opts agent.RunOptions, toolsetName string, listen string) error {
 	log := klog.FromContext(ctx)
 
-	toolset, err := toolsets.Get(toolsetName)
+	// The default toolset is for sessions created over ACP; every toolset is
+	// available so that a resumed session can run with the one it recorded.
+	defaultToolset, err := toolsets.Get(toolsetName)
 	if err != nil {
 		return err
-	}
-	opts.SystemPrompt = toolset.SystemPrompt()
-
-	// Image precedence, as in the CLI: -image flag / SANDBOX_IMAGE env, then
-	// the toolset's preferred image, then the generic default.
-	if opts.Image == "" {
-		opts.Image = toolset.DefaultImage()
-	}
-	if opts.Image == "" {
-		opts.Image = agent.DefaultImage
 	}
 
 	llmClient, err := llm.NewFromEnv(opts.ModelName)
@@ -117,27 +107,29 @@ func run(ctx context.Context, opts agent.RunOptions, toolsetName string, listen 
 		}
 	}()
 
-	toolsRegistry := tools.NewRegistry()
-	toolsRegistry.ToolTimeout = opts.ToolTimeout
-	toolset.RegisterTools(toolsRegistry)
-
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("failed to get user home directory: %w", err)
 	}
-	// Session history lives on the pod's local filesystem (see sessionRegistry
+	// Session history lives on the pod's local filesystem (see agent.Manager
 	// for the plan to externalize it).
 	sessionStore := sessions.NewFileStore(filepath.Join(homeDir, ".local", "sandboxed-tools"))
 
-	harness := agent.NewHarness(llmClient, sandboxClient, toolsRegistry, opts)
-	registry := &sessionRegistry{sessions: make(map[string]*activeSession)}
+	manager := agent.NewManager(sessionStore)
+	for _, name := range toolsets.Names() {
+		toolset, err := toolsets.Get(name)
+		if err != nil {
+			return err
+		}
+		manager.AddToolset(name, newHarness(ctx, toolset, llmClient, sandboxClient, opts))
+	}
 
 	listener, err := net.Listen("tcp", listen)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", listen, err)
 	}
 	defer listener.Close()
-	log.Info("serving ACP", "address", listener.Addr().String(), "model", opts.ModelName, "toolset", toolset.Name(), "image", opts.Image)
+	log.Info("serving ACP", "address", listener.Addr().String(), "model", opts.ModelName, "defaultToolset", defaultToolset.Name())
 
 	// Close the listener on shutdown so Accept returns.
 	go func() {
@@ -156,10 +148,31 @@ func run(ctx context.Context, opts agent.RunOptions, toolsetName string, listen 
 		log.Info("client connected", "remote", conn.RemoteAddr().String())
 		go func() {
 			defer conn.Close()
-			serveConn(ctx, harness, toolset.Name(), sessionStore, registry, conn)
+			serveConn(ctx, manager, defaultToolset.Name(), conn)
 			log.Info("client disconnected", "remote", conn.RemoteAddr().String())
 		}()
 	}
+}
+
+// newHarness builds the harness for one toolset: its tools, its system
+// prompt, and its sandbox image. Image precedence is as in the CLI: the
+// -image flag / SANDBOX_IMAGE env (which then applies to every toolset),
+// then the toolset's preferred image, then the generic default.
+func newHarness(ctx context.Context, toolset toolsets.Toolset, llmClient llm.ChatClient, sandboxClient *agent.SandboxClient, opts agent.RunOptions) *agent.Harness {
+	opts.SystemPrompt = toolset.SystemPrompt()
+	if opts.Image == "" {
+		opts.Image = toolset.DefaultImage()
+	}
+	if opts.Image == "" {
+		opts.Image = agent.DefaultImage
+	}
+
+	toolsRegistry := tools.NewRegistry()
+	toolsRegistry.ToolTimeout = opts.ToolTimeout
+	toolset.RegisterTools(toolsRegistry)
+
+	klog.FromContext(ctx).Info("toolset available", "toolset", toolset.Name(), "image", opts.Image)
+	return agent.NewHarness(llmClient, sandboxClient, toolsRegistry, opts)
 }
 
 // serveConn speaks ACP with one client until the connection closes.
@@ -169,7 +182,7 @@ func run(ctx context.Context, opts agent.RunOptions, toolsetName string, listen 
 // roles reversed: OnRequest serves the client's initialize / session/new /
 // session/prompt calls, Notify streams session updates, and Call asks the
 // client for tool call permission.
-func serveConn(ctx context.Context, harness *agent.Harness, toolsetName string, sessionStore sessions.Store, registry *sessionRegistry, conn net.Conn) {
+func serveConn(ctx context.Context, manager *agent.Manager, toolsetName string, conn net.Conn) {
 	// acp.Client answers each request on its own goroutine and Run returns
 	// as soon as the connection closes, without waiting for them. Scope the
 	// context to the connection so an in-flight RunTurn (LLM call, sandbox
@@ -181,56 +194,23 @@ func serveConn(ctx context.Context, harness *agent.Harness, toolsetName string, 
 	peer := acp.NewClient(conn, conn)
 
 	c := &acpConn{
-		ctx:          ctx,
-		peer:         peer,
-		harness:      harness,
-		toolsetName:  toolsetName,
-		sessionStore: sessionStore,
-		registry:     registry,
+		ctx:         ctx,
+		peer:        peer,
+		manager:     manager,
+		toolsetName: toolsetName,
 	}
 	peer.OnRequest = c.handleRequest
 
 	peer.Run()
 }
 
-// sessionRegistry holds the sessions loaded in this server. It is shared by
-// all connections so that a session ID always maps to a single in-memory
-// Session, even if several clients load it.
-//
-// Together with the file-backed sessions.Store this is the server's session
-// database, and it is deliberately simple for an example: process-local,
-// never evicted, and persisted only on the pod's volume. A future iteration
-// should consider externalizing it (a shared store with retention/eviction)
-// so sessions survive restarts, can be bounded, and can be served by more
-// than one replica.
-type sessionRegistry struct {
-	mu       sync.Mutex
-	sessions map[string]*activeSession
-}
-
-// activeSession is a loaded session. acp.Client dispatches each incoming
-// request on its own goroutine, while agent.Session and RunTurn are not
-// safe for concurrent use: turnMu serializes access to the session.
-type activeSession struct {
-	session *agent.Session
-	turnMu  sync.Mutex
-}
-
-func (r *sessionRegistry) get(sessionID string) *activeSession {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.sessions[sessionID]
-}
-
 // acpConn is the per-connection ACP server state.
 type acpConn struct {
 	ctx     context.Context
 	peer    *acp.Client
-	harness *agent.Harness
-	// toolsetName is recorded in the metadata of sessions created here.
-	toolsetName  string
-	sessionStore sessions.Store
-	registry     *sessionRegistry
+	manager *agent.Manager
+	// toolsetName is the toolset of sessions created on this connection.
+	toolsetName string
 }
 
 func (c *acpConn) handleRequest(method string, params json.RawMessage) (any, *acp.RPCError) {
@@ -250,11 +230,11 @@ func (c *acpConn) handleRequest(method string, params json.RawMessage) (any, *ac
 		if err := json.Unmarshal(params, &req); err != nil {
 			return nil, invalidParams(err)
 		}
-		sessionID, err := newSessionID()
+		sessionID, err := sessions.NewSessionID("acp")
 		if err != nil {
 			return nil, internalError(err)
 		}
-		if _, err := c.startSession(sessionID, false); err != nil {
+		if _, err := c.manager.Open(c.ctx, sessionID, c.openOptions(false)); err != nil {
 			return nil, internalError(err)
 		}
 		return acp.NewSessionResponse{SessionID: sessionID}, nil
@@ -267,16 +247,14 @@ func (c *acpConn) handleRequest(method string, params json.RawMessage) (any, *ac
 		if err := sessions.ValidateSessionName(req.SessionID); err != nil {
 			return nil, invalidParams(fmt.Errorf("invalid sessionId: %w", err))
 		}
-		active, err := c.startSession(req.SessionID, true)
+		active, err := c.manager.Open(c.ctx, req.SessionID, c.openOptions(true))
 		if err != nil {
 			if errors.Is(err, sessions.ErrNotFound) {
 				return nil, invalidParams(fmt.Errorf("unknown sessionId %q", req.SessionID))
 			}
 			return nil, internalError(err)
 		}
-		active.turnMu.Lock()
-		c.replayHistory(req.SessionID, active.session)
-		active.turnMu.Unlock()
+		c.replayHistory(req.SessionID, active.Messages())
 		return struct{}{}, nil
 
 	case "session/prompt":
@@ -291,45 +269,20 @@ func (c *acpConn) handleRequest(method string, params json.RawMessage) (any, *ac
 	}
 }
 
-// startSession returns the named session, building (or resuming) it if it
-// is not already loaded. With mustExist, an ID with no persisted history is
-// an error wrapping sessions.ErrNotFound rather than a new session. The
-// registry lock is held across the build so two concurrent loads cannot
-// produce two Session objects for one session ID.
-func (c *acpConn) startSession(sessionID string, mustExist bool) (*activeSession, error) {
-	c.registry.mu.Lock()
-	defer c.registry.mu.Unlock()
-
-	if active := c.registry.sessions[sessionID]; active != nil {
-		return active, nil
+// openOptions are the Manager.Open options for sessions on this connection:
+// created with (or, if they predate metadata, resumed with) the connection's
+// toolset.
+func (c *acpConn) openOptions(mustExist bool) agent.OpenOptions {
+	return agent.OpenOptions{
+		MustExist: mustExist,
+		Metadata:  sessions.Metadata{Toolset: c.toolsetName},
 	}
-
-	if mustExist {
-		// BuildSession creates-or-resumes, so session/load has to check the
-		// store itself; otherwise a typo in the ID would silently start a
-		// fresh conversation.
-		if _, err := c.sessionStore.LoadSession(c.ctx, sessionID); err != nil {
-			return nil, err
-		}
-	}
-
-	session, err := c.harness.BuildSession(c.ctx, c.sessionStore, sessionID, sessions.Metadata{Toolset: c.toolsetName})
-	if err != nil {
-		return nil, err
-	}
-	if err := c.harness.EnsureSystemPrompt(c.ctx, session); err != nil {
-		return nil, err
-	}
-
-	active := &activeSession{session: session}
-	c.registry.sessions[sessionID] = active
-	return active, nil
 }
 
 // replayHistory streams a resumed session's messages to the client, as ACP
 // requires for session/load.
-func (c *acpConn) replayHistory(sessionID string, session *agent.Session) {
-	for _, msg := range session.Messages() {
+func (c *acpConn) replayHistory(sessionID string, messages []llm.Message) {
+	for _, msg := range messages {
 		if msg.Content == nil || *msg.Content == "" {
 			continue
 		}
@@ -349,7 +302,7 @@ func (c *acpConn) replayHistory(sessionID string, session *agent.Session) {
 }
 
 func (c *acpConn) prompt(req acp.PromptRequest) (any, *acp.RPCError) {
-	active := c.registry.get(req.SessionID)
+	active := c.manager.Get(req.SessionID)
 	if active == nil {
 		return nil, invalidParams(fmt.Errorf("unknown sessionId %q (create one with session/new)", req.SessionID))
 	}
@@ -364,15 +317,14 @@ func (c *acpConn) prompt(req acp.PromptRequest) (any, *acp.RPCError) {
 		return nil, invalidParams(fmt.Errorf("prompt contains no text content"))
 	}
 
-	// ACP allows one prompt per session at a time; reject rather than queue a
-	// concurrent one so the client gets an immediate, explicit answer.
-	if !active.turnMu.TryLock() {
-		return nil, invalidParams(fmt.Errorf("session %q is already processing a prompt", req.SessionID))
-	}
-	defer active.turnMu.Unlock()
-
 	events := &acpTurnEvents{conn: c, sessionID: req.SessionID}
-	if err := c.harness.RunTurn(c.ctx, active.session, text.String(), events); err != nil {
+	if err := active.RunTurn(c.ctx, text.String(), events); err != nil {
+		// ACP allows one prompt per session at a time; the manager rejects
+		// rather than queues a concurrent one, so the client gets an
+		// immediate, explicit answer.
+		if errors.Is(err, agent.ErrSessionBusy) {
+			return nil, invalidParams(fmt.Errorf("session %q is already processing a prompt", req.SessionID))
+		}
 		return nil, internalError(err)
 	}
 
@@ -470,16 +422,6 @@ func textContent(text string) json.RawMessage {
 		panic(err)
 	}
 	return data
-}
-
-// newSessionID generates a random session ID that satisfies
-// sessions.ValidateSessionName (lowercase alphanumeric, at most 40 chars).
-func newSessionID() (string, error) {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		return "", fmt.Errorf("generating session ID: %w", err)
-	}
-	return fmt.Sprintf("acp%x", b), nil
 }
 
 func invalidParams(err error) *acp.RPCError {

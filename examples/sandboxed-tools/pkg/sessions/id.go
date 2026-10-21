@@ -14,7 +14,10 @@
 
 package sessions
 
-import "fmt"
+import (
+	"crypto/rand"
+	"fmt"
+)
 
 // ValidateSessionName validates that the session name is valid.
 // We use session names in kubernetes and in filesystem paths,
@@ -46,4 +49,19 @@ func isLowerAlphaNumeric(s string) bool {
 		}
 	}
 	return true
+}
+
+// NewSessionID generates a random session name with the given prefix that
+// satisfies ValidateSessionName (lowercase alphanumeric, at most 40
+// characters), for front ends that name sessions themselves.
+func NewSessionID(prefix string) (string, error) {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generating session ID: %w", err)
+	}
+	id := fmt.Sprintf("%s%x", prefix, b)
+	if err := ValidateSessionName(id); err != nil {
+		return "", fmt.Errorf("invalid session ID prefix %q: %w", prefix, err)
+	}
+	return id, nil
 }
