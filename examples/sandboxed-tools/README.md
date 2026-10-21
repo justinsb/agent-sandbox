@@ -27,6 +27,7 @@ The application accepts the following command-line flags:
 | `-image` | The container image used for the temporary sandbox pod. Precedence: this flag, then `SANDBOX_IMAGE`, then the toolset's default image, then `debian:bookworm-slim`. | Toolset default |
 | `-homedir` | The directory inside the sandbox that is persisted via snapshot/restore. | `/home/clawtainer` (overrides `SANDBOX_HOME_DIR` env var) |
 | `-tool-timeout` | Maximum duration a single tool invocation (`run_command`, `ls`, `read`, or `write`) may run before it is cancelled. Accepts Go duration syntax, e.g. `30s`, `2m`, `1h`. `<= 0` disables the timeout. | `2m` |
+| `-sandbox-env-secret` | Name of a Secret in the sandbox namespace whose keys become environment variables of every sandbox container, e.g. a `GH_TOKEN` for `gh` and `git`. The Secret must exist or the sandbox pod will not start. | none (overrides `SANDBOX_ENV_SECRET` env var) |
 
 > **Note:** `-tool-timeout` cancels the Kubernetes exec connection and unblocks the agent loop; it does not guarantee that every process the command started inside the container (e.g. a detached background process) has actually been terminated.
 
@@ -43,6 +44,7 @@ The application is configured via environment variables (usually for API keys an
 | `SANDBOX_NAMESPACE`| Fallback Kubernetes namespace if `-namespace` flag is not set. | `default` |
 | `SANDBOX_HOME_DIR` | Fallback persisted directory if `-homedir` flag is not set. | `/home/clawtainer` |
 | `TOOLSET` | Fallback toolset if `-toolset` flag is not set. | `basic` |
+| `SANDBOX_ENV_SECRET` | Fallback sandbox environment Secret if `-sandbox-env-secret` flag is not set. | none |
 
 ## Toolsets
 
@@ -86,7 +88,7 @@ go run ./cmd/sandboxed-tools-cli -session mysession -toolset geminicli -image ki
 
 A toolset (`pkg/toolsets/supervisor`) for a session that works GitHub issues by delegating them to child sessions instead of doing the work itself: it reads an issue with `gh`, spawns a `geminicli` child with a self-contained prompt, follows the child's progress, sends it follow-ups, and reports back (the system prompt spells out this workflow). It is only available in the ACP server (`TOOLSET=supervisor`), because it acts on sessions through the server's session manager; the single-session CLI cannot run it. It uses the `geminicli-toolbox` image, which ships `gh`.
 
-* **`gh`**: Runs the GitHub CLI in the supervisor's own sandbox with the given arguments (no shell, so only `gh` can be run this way), returning the combined output and exit code. `gh` authenticates with a `GH_TOKEN` in the sandbox's environment.
+* **`gh`**: Runs the GitHub CLI in the supervisor's own sandbox with the given arguments (no shell, so only `gh` can be run this way), returning the combined output and exit code. `gh` authenticates with a `GH_TOKEN` in the sandbox's environment: put one in a Secret and name it with `SANDBOX_ENV_SECRET` (see [Configuration](#configuration)). Children get the same environment, so a `geminicli` child can push and open pull requests with `gh auth setup-git`.
 * **`spawn_child_session`**: Creates a new session as a *child* of the calling session, with its own toolset (`geminicli` by default) and its own sandbox, and sends it an initial prompt. The call returns the child's session ID immediately; the child then works autonomously in the background, approving its own tool calls. The child's `metadata.json` records the parent, and any ACP client can `session/load` the child's ID to watch it.
 * **`list_child_sessions`**: Lists the calling session's children (from the session store, so children from before a server restart are included) with their toolset, state and age.
 * **`describe_session`**: Reports one child's state: whether a turn is in progress and which tool it is running, how long it has been idle, its message count, its last reply, and the error that ended its last turn, if any. A session may only describe its own children.
@@ -197,7 +199,14 @@ kubectl -n default port-forward deployment/sandboxed-tools-acp-server 8090:8090
 ```
 
 Reconnect the client as above; the agent now answers with Gemini and still runs its tools in
-Agent Sandboxes. Any other variable from the [Configuration](#configuration) table goes in the
+Agent Sandboxes. To give the sandboxes credentials, for example for the `supervisor` toolset's
+`gh` tool and for children that push branches, put them in a Secret and add
+`SANDBOX_ENV_SECRET` to the server's Secret:
+
+```bash
+kubectl -n default create secret generic sandbox-env "--from-literal=GH_TOKEN=${GH_TOKEN}"
+# ... and --from-literal=SANDBOX_ENV_SECRET=sandbox-env in the sandboxed-tools-acp-server Secret
+``` Any other variable from the [Configuration](#configuration) table goes in the
 same Secret, for example `OPENAI_BASE_URL` for a different OpenAI-compatible endpoint, or
 `TOOLSET=geminicli` together with `SANDBOX_IMAGE` pointing at an image that contains
 `geminicli-toolbox` (see [Toolsets](#toolsets)). Sandboxes are created in the namespace the

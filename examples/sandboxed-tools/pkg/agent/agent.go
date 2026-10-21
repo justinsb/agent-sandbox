@@ -491,6 +491,15 @@ func (h *Harness) CreateSandbox(ctx context.Context, session *Session) (*Sandbox
 	image := h.opts.Image
 	homeDir := h.opts.HomeDir
 
+	var envFrom []corev1.EnvFromSource
+	if secret := h.opts.SandboxEnvSecret; secret != "" {
+		envFrom = append(envFrom, corev1.EnvFromSource{
+			SecretRef: &corev1.SecretEnvSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: secret},
+			},
+		})
+	}
+
 	policy := sandboxv1beta1.ShutdownPolicyDelete
 	sb := &sandboxv1beta1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{
@@ -519,6 +528,7 @@ func (h *Harness) CreateSandbox(ctx context.Context, session *Session) (*Sandbox
 										Value: homeDir,
 									},
 								},
+								EnvFrom: envFrom,
 							},
 						},
 						Volumes: []corev1.Volume{
@@ -619,6 +629,13 @@ type RunOptions struct {
 	// ToolTimeout bounds how long a single tool invocation may run before it
 	// is cancelled. <= 0 disables the timeout. Default: DefaultToolTimeout.
 	ToolTimeout time.Duration
+
+	// SandboxEnvSecret, if set, names a Secret in the sandbox namespace whose
+	// keys become environment variables of every sandbox container: the way
+	// to give tools in the sandbox credentials (a GH_TOKEN for gh and git,
+	// for example) without putting them in prompts or in the pod spec. The
+	// Secret must exist, or the sandbox pod will not start.
+	SandboxEnvSecret string
 }
 
 // DefaultImage is the sandbox image used when neither the flags, the
@@ -652,6 +669,8 @@ func (o *RunOptions) InitDefaults() {
 	o.ModelName = modelName
 
 	o.ToolTimeout = DefaultToolTimeout
+
+	o.SandboxEnvSecret = os.Getenv("SANDBOX_ENV_SECRET")
 }
 
 // TurnEvents receives progress callbacks while RunTurn processes a user

@@ -20,8 +20,13 @@ import (
 	"testing"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+
+	"sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned/fake"
 	"sigs.k8s.io/agent-sandbox/examples/sandboxed-tools/pkg/llm"
 	"sigs.k8s.io/agent-sandbox/examples/sandboxed-tools/pkg/sessions"
+	"sigs.k8s.io/agent-sandbox/examples/sandboxed-tools/pkg/tools"
 )
 
 // newTestSession returns a Session backed by a scratch backup directory.
@@ -235,5 +240,40 @@ func TestBuildSession_Metadata(t *testing.T) {
 	}
 	if _, err := store.LoadMetadata(ctx, "legacy"); err == nil {
 		t.Error("legacy session must not get metadata written")
+	}
+}
+
+func TestCreateSandbox_EnvFromSecret(t *testing.T) {
+	ctx := t.Context()
+	for _, secret := range []string{"", "sandbox-env"} {
+		t.Run("secret="+secret, func(t *testing.T) {
+			client := &SandboxClient{agentsClient: fake.NewSimpleClientset(), sandboxes: map[types.NamespacedName]*Sandbox{}}
+			harness := NewHarness(nil, client, tools.NewRegistry(), RunOptions{Namespace: "ns", HomeDir: "/home/x", Image: "img", SandboxEnvSecret: secret})
+			session, err := harness.BuildSession(ctx, sessions.NewFileStore(t.TempDir()), "s1", sessions.Metadata{Toolset: "basic"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := harness.CreateSandbox(ctx, session); err != nil {
+				t.Fatalf("CreateSandbox: %v", err)
+			}
+
+			created, err := client.agentsClient.AgentsV1beta1().Sandboxes("ns").Get(ctx, "s1", metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("Get created sandbox: %v", err)
+			}
+			container := created.Spec.PodTemplate.Spec.Containers[0]
+			if secret == "" {
+				if len(container.EnvFrom) != 0 {
+					t.Errorf("EnvFrom = %+v, want none without a secret", container.EnvFrom)
+				}
+				return
+			}
+			if len(container.EnvFrom) != 1 || container.EnvFrom[0].SecretRef == nil || container.EnvFrom[0].SecretRef.Name != secret {
+				t.Errorf("EnvFrom = %+v, want a secretRef to %q", container.EnvFrom, secret)
+			}
+			if container.EnvFrom[0].SecretRef.Optional != nil && *container.EnvFrom[0].SecretRef.Optional {
+				t.Error("the secret must be required, so a missing one fails loudly rather than silently leaving tools without credentials")
+			}
+		})
 	}
 }

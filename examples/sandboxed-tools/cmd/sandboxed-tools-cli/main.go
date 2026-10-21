@@ -74,6 +74,7 @@ func main() {
 	flag.StringVar(&opts.HomeDir, "homedir", opts.HomeDir, "Home directory in the sandbox; this is currently the only directory that we persist with snapshot/restore.")
 	flag.StringVar(&toolsetName, "toolset", toolsetName, fmt.Sprintf("Toolset (tools + system prompt) to expose to the LLM; one of: %s", strings.Join(toolsets.Names(), ", ")))
 	flag.DurationVar(&opts.ToolTimeout, "tool-timeout", opts.ToolTimeout, "Maximum duration a single tool invocation may run before it is cancelled (Go duration syntax, e.g. \"30s\", \"2m\"). <= 0 disables the timeout.")
+	flag.StringVar(&opts.SandboxEnvSecret, "sandbox-env-secret", opts.SandboxEnvSecret, "Name of a Secret in the sandbox namespace to expose as environment variables in every sandbox (e.g. a GH_TOKEN for gh and git). Empty means none.")
 	flag.Parse()
 
 	log := klog.FromContext(ctx)
