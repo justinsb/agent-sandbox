@@ -211,7 +211,7 @@ func TestRenderTranscript(t *testing.T) {
 	if strings.Contains(out, "secret") {
 		t.Errorf("system prompt leaked: %q", out)
 	}
-	for _, want := range []string{"4 messages", "#1 user", "-> run_shell_command({\"command\":\"make\"})", "[3000 more bytes truncated]", "#4 assistant\ndone"} {
+	for _, want := range []string{"4 messages", "#1 user", "-> run_shell_command({\"command\":\"make\"})", "[3000 more bytes truncated]", "--- #4 assistant ---\ndone"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("render = %q, want %q", out, want)
 		}
