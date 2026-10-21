@@ -226,3 +226,49 @@ func TestRenderTranscript(t *testing.T) {
 		t.Errorf("truncate on a rune boundary = %q", got)
 	}
 }
+
+func TestWriteIntoSessionTool(t *testing.T) {
+	m := newTestManager(t)
+	registry := tools.NewRegistry()
+	New(m).RegisterTools(registry)
+	ctx := tools.WithCallerSession(context.Background(), "parent1")
+	write := func(args string) (string, error) {
+		msg, err := registry.Call(ctx, noSandbox{}, llm.ToolCall{ID: "c", Function: llm.FunctionCall{Name: WriteIntoSessionToolName, Arguments: args}})
+		if err != nil {
+			return "", err
+		}
+		return *msg.Content, nil
+	}
+
+	childID, err := m.Spawn(ctx, "parent1", DefaultChildToolset, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Get(childID).Messages()
+
+	out, err := write(`{"session_id":"` + childID + `","prompt":"second"}`)
+	if err != nil {
+		t.Fatalf("write_into_session: %v", err)
+	}
+	if !strings.Contains(out, "Sent the prompt to session "+childID) {
+		t.Errorf("result = %q", out)
+	}
+	if msgs := m.Get(childID).Messages(); len(msgs) != 5 || *msgs[3].Content != "second" {
+		t.Errorf("child transcript has %d messages, want 5 with the follow-up prompt", len(msgs))
+	}
+
+	other, err := m.Spawn(ctx, "parent2", DefaultChildToolset, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Get(other).Messages()
+	for _, args := range []string{
+		`{"session_id":"` + other + `","prompt":"y"}`,
+		`{"session_id":"` + childID + `"}`,
+		`{"prompt":"y"}`,
+	} {
+		if _, err := write(args); err == nil {
+			t.Errorf("write_into_session(%s) should fail", args)
+		}
+	}
+}

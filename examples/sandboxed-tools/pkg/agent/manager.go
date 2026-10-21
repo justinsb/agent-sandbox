@@ -270,6 +270,28 @@ func (m *Manager) Transcript(ctx context.Context, caller, sessionID string) ([]l
 	return messages, nil
 }
 
+// Prompt sends input to sessionID on behalf of caller, which must be its
+// parent (ErrNotChild otherwise), and returns once the child's turn has
+// started; like a spawned child's first turn it runs in the background,
+// autonomously. A child that is not loaded (after a restart) is resumed
+// first. ErrSessionBusy is returned if the child is mid-turn: prompts are
+// not queued, so the parent should check back rather than pile them up.
+func (m *Manager) Prompt(ctx context.Context, caller, sessionID, input string) error {
+	metadata, err := m.childMetadata(ctx, caller, sessionID)
+	if err != nil {
+		return err
+	}
+	child, err := m.Open(ctx, sessionID, OpenOptions{MustExist: true, Metadata: *metadata})
+	if err != nil {
+		return fmt.Errorf("resuming child session %q: %w", sessionID, err)
+	}
+	if err := child.RunTurnDetached(m.ctx, input, autonomousEvents{}); err != nil {
+		return fmt.Errorf("prompting child session %q: %w", sessionID, err)
+	}
+	klog.FromContext(ctx).Info("prompted child session", "session", sessionID, "parent", caller)
+	return nil
+}
+
 // childMetadata loads sessionID's metadata, checking that caller is its
 // parent.
 func (m *Manager) childMetadata(ctx context.Context, caller, sessionID string) (*sessions.Metadata, error) {

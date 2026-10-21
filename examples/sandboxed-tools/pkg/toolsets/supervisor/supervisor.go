@@ -51,7 +51,7 @@ const systemPrompt = `You are a supervisor agent. You do not do engineering work
 
 Use spawn_child_session to start a child on a task. Give it a complete, self-contained prompt: everything it needs to know about the task, since it cannot see this conversation. The call returns the child's session ID as soon as the child has started; the child then works on its own, approving its own tool calls.
 
-Use list_child_sessions to see the children you have started and describe_session to check on one: whether it is still working (and on which tool), how long it has been idle, and its last reply. Use read_session to read a child's transcript when you need to understand what it did or why it is stuck.
+Use list_child_sessions to see the children you have started and describe_session to check on one: whether it is still working (and on which tool), how long it has been idle, and its last reply. Use read_session to read a child's transcript when you need to understand what it did or why it is stuck. Use write_into_session to send a child a follow-up: more work, a correction, or the answer to a question it asked in its last reply. A child only accepts a prompt when it is idle.
 
 Report to the user which children you started and what each one is doing.`
 
@@ -81,6 +81,7 @@ func (t *Toolset) RegisterTools(registry *tools.Registry) {
 	registry.Add(&ListChildSessionsTool{manager: t.manager})
 	registry.Add(&DescribeSessionTool{manager: t.manager})
 	registry.Add(&ReadSessionTool{manager: t.manager})
+	registry.Add(&WriteIntoSessionTool{manager: t.manager})
 }
 
 // DefaultImage implements toolsets.Toolset. The supervisor runs no tools in

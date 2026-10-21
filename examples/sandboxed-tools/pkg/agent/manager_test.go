@@ -342,3 +342,59 @@ func TestManagerTranscript(t *testing.T) {
 		t.Errorf("Transcript after restart = %d messages, %v; want 3", len(msgs), err)
 	}
 }
+
+func TestManagerPrompt(t *testing.T) {
+	ctx := t.Context()
+	m, harnesses := newTestManager(t, &llm.ElizaClient{})
+
+	child, err := m.Spawn(ctx, "parent1", "basic", "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Get(child).Messages()
+
+	if err := m.Prompt(ctx, "parent1", child, "second"); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	msgs := m.Get(child).Messages() // waits for the turn
+	if len(msgs) != 5 || *msgs[3].Content != "second" {
+		t.Errorf("transcript after Prompt = %d messages, want 5 with 'second' as the second prompt", len(msgs))
+	}
+
+	if err := m.Prompt(ctx, "parent2", child, "x"); !errors.Is(err, ErrNotChild) {
+		t.Errorf("Prompt by non-parent err = %v, want ErrNotChild", err)
+	}
+
+	// A child that is not loaded (after a restart) is resumed with its
+	// recorded toolset and prompted.
+	m2 := NewManager(ctx, m.store)
+	for name, h := range harnesses {
+		m2.AddToolset(name, h)
+	}
+	if err := m2.Prompt(ctx, "parent1", child, "third"); err != nil {
+		t.Fatalf("Prompt (after restart): %v", err)
+	}
+	resumed := m2.Get(child)
+	if resumed == nil {
+		t.Fatal("Prompt should load the child")
+	}
+	if msgs := resumed.Messages(); len(msgs) != 7 || resumed.harness != harnesses["basic"] {
+		t.Errorf("after restart: %d messages, want 7 run with the basic harness", len(msgs))
+	}
+}
+
+func TestManagerPrompt_Busy(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	llmClient := &blockingLLM{started: make(chan struct{})}
+	m, _ := newTestManager(t, llmClient)
+
+	child, err := m.Spawn(ctx, "parent1", "basic", "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-llmClient.started
+	if err := m.Prompt(ctx, "parent1", child, "second"); !errors.Is(err, ErrSessionBusy) {
+		t.Errorf("Prompt while busy err = %v, want ErrSessionBusy", err)
+	}
+}
