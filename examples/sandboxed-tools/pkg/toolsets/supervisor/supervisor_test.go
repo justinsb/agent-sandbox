@@ -272,3 +272,54 @@ func TestWriteIntoSessionTool(t *testing.T) {
 		}
 	}
 }
+
+// recordingSandbox is a tools.Sandbox that records the command it ran and
+// returns canned output.
+type recordingSandbox struct {
+	command  []string
+	stdout   string
+	stderr   string
+	exitCode int
+}
+
+func (r *recordingSandbox) ExecCommand(_ context.Context, opts tools.ExecCommandOptions) (*tools.ExecCommandResult, error) {
+	r.command = opts.Command
+	if _, err := opts.Stdout.Write([]byte(r.stdout)); err != nil {
+		return nil, err
+	}
+	if _, err := opts.Stderr.Write([]byte(r.stderr)); err != nil {
+		return nil, err
+	}
+	return &tools.ExecCommandResult{ExitCode: r.exitCode}, nil
+}
+
+func TestGhTool(t *testing.T) {
+	registry := tools.NewRegistry()
+	registry.Add(&GhTool{})
+	ctx := context.Background()
+
+	sandbox := &recordingSandbox{stdout: "#42 Fix the bug\n"}
+	msg, err := registry.Call(ctx, sandbox, llm.ToolCall{ID: "c", Function: llm.FunctionCall{Name: GhToolName, Arguments: `{"args":["issue","view","42","--repo","org/repo"]}`}})
+	if err != nil {
+		t.Fatalf("gh: %v", err)
+	}
+	if got := strings.Join(sandbox.command, " "); got != "gh issue view 42 --repo org/repo" {
+		t.Errorf("command = %q, want gh with the arguments and no shell", got)
+	}
+	if *msg.Content != "Output: #42 Fix the bug\n" {
+		t.Errorf("content = %q", *msg.Content)
+	}
+
+	sandbox = &recordingSandbox{stderr: "not logged in\n", exitCode: 4}
+	msg, err = registry.Call(ctx, sandbox, llm.ToolCall{ID: "c", Function: llm.FunctionCall{Name: GhToolName, Arguments: `{"args":["auth","status"]}`}})
+	if err != nil {
+		t.Fatalf("gh (failure): %v", err)
+	}
+	if !strings.Contains(*msg.Content, "not logged in") || !strings.Contains(*msg.Content, "Exit Code: 4") {
+		t.Errorf("content = %q, want stderr and the exit code", *msg.Content)
+	}
+
+	if _, err := registry.Call(ctx, &recordingSandbox{}, llm.ToolCall{ID: "c", Function: llm.FunctionCall{Name: GhToolName, Arguments: `{"args":[]}`}}); err == nil {
+		t.Error("gh with no args should fail")
+	}
+}

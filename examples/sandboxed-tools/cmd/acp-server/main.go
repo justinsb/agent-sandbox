@@ -411,7 +411,7 @@ func toolCallUpdate(call llm.ToolCall, status string) acp.SessionUpdate {
 // ACP tool kind vocabulary.
 func toolKind(toolName string) string {
 	switch toolName {
-	case "run_command", geminicli.ShellToolName:
+	case "run_command", geminicli.ShellToolName, supervisor.GhToolName:
 		return "execute"
 	case "ls", toolbox.ListDirectoryToolName, toolbox.GlobToolName, toolbox.GrepToolName:
 		return "search"

@@ -13,8 +13,9 @@
 // limitations under the License.
 
 // Package supervisor is a toolset for a session that supervises other
-// sessions: it creates child sessions (each with its own toolset and
-// sandbox) and delegates work to them, rather than doing the work itself.
+// sessions: it reads work from GitHub with the gh CLI, creates child
+// sessions (each with its own toolset and sandbox) to do it, and follows
+// them up, rather than doing the engineering work itself.
 //
 // The toolset acts on sessions through an agent.Manager, so it is only
 // available in front ends that have one (the ACP server), not in the
@@ -47,13 +48,30 @@ const Name = "supervisor"
 const DefaultChildToolset = "geminicli"
 
 // systemPrompt seeds every new supervisor session.
-const systemPrompt = `You are a supervisor agent. You do not do engineering work yourself: you delegate it to child sessions, each of which is an autonomous coding agent with its own sandbox, and you coordinate them.
+const systemPrompt = `You are a supervisor agent for software engineering work tracked on GitHub. You do not write code yourself: you delegate engineering tasks to child sessions, each of which is an autonomous coding agent (gemini-cli) with its own sandbox, and you coordinate them, watch their progress, and report back.
 
-Use spawn_child_session to start a child on a task. Give it a complete, self-contained prompt: everything it needs to know about the task, since it cannot see this conversation. The call returns the child's session ID as soon as the child has started; the child then works on its own, approving its own tool calls.
+# Your tools
 
-Use list_child_sessions to see the children you have started and describe_session to check on one: whether it is still working (and on which tool), how long it has been idle, and its last reply. Use read_session to read a child's transcript when you need to understand what it did or why it is stuck. Use write_into_session to send a child a follow-up: more work, a correction, or the answer to a question it asked in its last reply. A child only accepts a prompt when it is idle.
+- gh: the GitHub CLI, run in your own sandbox. Use it to read issues and pull requests, comment on them, and check CI status. Prefer --json output when you need to act on the result.
+- spawn_child_session: starts a child on a task and returns its session ID at once. The child cannot see this conversation, so its prompt must be complete and self-contained: the repository, the issue number and its full text, what "done" looks like, and how to deliver the result.
+- list_child_sessions and describe_session: what your children are doing. A child is "running" while it works on a prompt (describe_session names the tool it is running and for how long) and "idle" once it has replied.
+- read_session: a child's transcript. Read it when a child is idle with an unclear reply, when it seems stuck, or before deciding it has failed.
+- write_into_session: a follow-up prompt for an idle child: more work, a correction, or the answer to a question it asked.
 
-Report to the user which children you started and what each one is doing.`
+# How to work an issue
+
+1. Read the issue with gh (gh issue view <number> --repo <owner/repo> --comments) so that you understand the request and any discussion.
+2. Spawn one child for the issue. In its prompt, include the repository, the issue number and text, the branch name to use, and the instructions to clone the repository, make the change, run the relevant tests, commit, push the branch, and open a pull request that references the issue; tell it to end with a short summary of what it did and the PR URL, or with what blocked it.
+3. Check on the child with describe_session. Children take minutes, not seconds: when one is still running, tell the user what it is doing rather than waiting on it in a loop.
+4. When the child is idle, read its last reply (and its transcript if the reply is unclear). If the work is incomplete, send a follow-up with write_into_session. If it is done, verify with gh that the pull request exists and leave a comment on the issue linking it.
+5. Report to the user: which children you started, the state of each, and the pull requests they opened.
+
+# Rules
+
+- One child per issue. Do not spawn a second child for the same task unless the first has failed and read_session shows why.
+- Never put secrets or credentials in a prompt to a child.
+- Do not merge pull requests or close issues unless the user asks you to.
+- Be concise with the user; lead with the state of the work.`
 
 // Toolset is the supervisor toolset.
 type Toolset struct {
@@ -77,6 +95,7 @@ func (t *Toolset) SystemPrompt() string {
 
 // RegisterTools implements toolsets.Toolset.
 func (t *Toolset) RegisterTools(registry *tools.Registry) {
+	registry.Add(&GhTool{})
 	registry.Add(&SpawnChildSessionTool{manager: t.manager})
 	registry.Add(&ListChildSessionsTool{manager: t.manager})
 	registry.Add(&DescribeSessionTool{manager: t.manager})
@@ -84,9 +103,9 @@ func (t *Toolset) RegisterTools(registry *tools.Registry) {
 	registry.Add(&WriteIntoSessionTool{manager: t.manager})
 }
 
-// DefaultImage implements toolsets.Toolset. The supervisor runs no tools in
-// its sandbox yet, so it shares the geminicli image rather than needing one
-// of its own.
+// DefaultImage implements toolsets.Toolset. The supervisor's only sandbox
+// tool is gh, which the geminicli image ships, so it shares that image
+// rather than needing one of its own.
 func (t *Toolset) DefaultImage() string {
 	return geminicli.DefaultImage
 }

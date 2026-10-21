@@ -1,9 +1,11 @@
-# Sandbox image for the "geminicli" toolset of the sandboxed-tools example.
+# Sandbox image for the "geminicli" and "supervisor" toolsets of the
+# sandboxed-tools example.
 #
 # It bundles the geminicli-toolbox binary (the Go implementation of the
 # gemini-cli filesystem tools, see
 # examples/sandboxed-tools/pkg/toolsets/geminicli/toolbox) on top of a small
-# Debian base that provides bash and git for run_shell_command.
+# Debian base that provides bash and git for run_shell_command, and the
+# GitHub CLI (gh) for the supervisor toolset's gh tool.
 #
 # Build from the REPOSITORY ROOT (the build needs the Go module context):
 #
@@ -38,7 +40,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=false -ldflags="-s -w"
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git curl procps \
+    && apt-get install -y --no-install-recommends ca-certificates git curl procps gh \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /geminicli-toolbox /usr/local/bin/geminicli-toolbox
 

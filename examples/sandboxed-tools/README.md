@@ -84,8 +84,9 @@ go run ./cmd/sandboxed-tools-cli -session mysession -toolset geminicli -image ki
 
 ### `supervisor` (ACP server only)
 
-A toolset (`pkg/toolsets/supervisor`) for a session that coordinates other sessions instead of doing the work itself. It is only available in the ACP server (`TOOLSET=supervisor`), because it acts on sessions through the server's session manager; the single-session CLI cannot run it.
+A toolset (`pkg/toolsets/supervisor`) for a session that works GitHub issues by delegating them to child sessions instead of doing the work itself: it reads an issue with `gh`, spawns a `geminicli` child with a self-contained prompt, follows the child's progress, sends it follow-ups, and reports back (the system prompt spells out this workflow). It is only available in the ACP server (`TOOLSET=supervisor`), because it acts on sessions through the server's session manager; the single-session CLI cannot run it. It uses the `geminicli-toolbox` image, which ships `gh`.
 
+* **`gh`**: Runs the GitHub CLI in the supervisor's own sandbox with the given arguments (no shell, so only `gh` can be run this way), returning the combined output and exit code. `gh` authenticates with a `GH_TOKEN` in the sandbox's environment.
 * **`spawn_child_session`**: Creates a new session as a *child* of the calling session, with its own toolset (`geminicli` by default) and its own sandbox, and sends it an initial prompt. The call returns the child's session ID immediately; the child then works autonomously in the background, approving its own tool calls. The child's `metadata.json` records the parent, and any ACP client can `session/load` the child's ID to watch it.
 * **`list_child_sessions`**: Lists the calling session's children (from the session store, so children from before a server restart are included) with their toolset, state and age.
 * **`describe_session`**: Reports one child's state: whether a turn is in progress and which tool it is running, how long it has been idle, its message count, its last reply, and the error that ended its last turn, if any. A session may only describe its own children.
