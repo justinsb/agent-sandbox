@@ -156,7 +156,7 @@ func run(ctx context.Context, opts agent.RunOptions, toolsetName string, listen 
 		log.Info("client connected", "remote", conn.RemoteAddr().String())
 		go func() {
 			defer conn.Close()
-			serveConn(ctx, harness, sessionStore, registry, conn)
+			serveConn(ctx, harness, toolset.Name(), sessionStore, registry, conn)
 			log.Info("client disconnected", "remote", conn.RemoteAddr().String())
 		}()
 	}
@@ -169,7 +169,7 @@ func run(ctx context.Context, opts agent.RunOptions, toolsetName string, listen 
 // roles reversed: OnRequest serves the client's initialize / session/new /
 // session/prompt calls, Notify streams session updates, and Call asks the
 // client for tool call permission.
-func serveConn(ctx context.Context, harness *agent.Harness, sessionStore sessions.Store, registry *sessionRegistry, conn net.Conn) {
+func serveConn(ctx context.Context, harness *agent.Harness, toolsetName string, sessionStore sessions.Store, registry *sessionRegistry, conn net.Conn) {
 	// acp.Client answers each request on its own goroutine and Run returns
 	// as soon as the connection closes, without waiting for them. Scope the
 	// context to the connection so an in-flight RunTurn (LLM call, sandbox
@@ -184,6 +184,7 @@ func serveConn(ctx context.Context, harness *agent.Harness, sessionStore session
 		ctx:          ctx,
 		peer:         peer,
 		harness:      harness,
+		toolsetName:  toolsetName,
 		sessionStore: sessionStore,
 		registry:     registry,
 	}
@@ -223,9 +224,11 @@ func (r *sessionRegistry) get(sessionID string) *activeSession {
 
 // acpConn is the per-connection ACP server state.
 type acpConn struct {
-	ctx          context.Context
-	peer         *acp.Client
-	harness      *agent.Harness
+	ctx     context.Context
+	peer    *acp.Client
+	harness *agent.Harness
+	// toolsetName is recorded in the metadata of sessions created here.
+	toolsetName  string
 	sessionStore sessions.Store
 	registry     *sessionRegistry
 }
@@ -310,7 +313,7 @@ func (c *acpConn) startSession(sessionID string, mustExist bool) (*activeSession
 		}
 	}
 
-	session, err := c.harness.BuildSession(c.ctx, c.sessionStore, sessionID)
+	session, err := c.harness.BuildSession(c.ctx, c.sessionStore, sessionID, sessions.Metadata{Toolset: c.toolsetName})
 	if err != nil {
 		return nil, err
 	}

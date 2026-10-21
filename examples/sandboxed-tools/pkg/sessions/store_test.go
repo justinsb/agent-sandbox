@@ -19,6 +19,7 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"sigs.k8s.io/agent-sandbox/examples/sandboxed-tools/pkg/llm"
@@ -105,5 +106,60 @@ func TestFileStore(t *testing.T) {
 	wantMsgs := []llm.Message{msg1, msg2, msg3, msg4}
 	if diff := cmp.Diff(wantMsgs, msgs); diff != "" {
 		t.Errorf("messages mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestFileStoreMetadata(t *testing.T) {
+	ctx := context.Background()
+	store := NewFileStore(t.TempDir())
+
+	// No metadata until it is saved, including for a session that already
+	// has messages (one recorded before metadata existed).
+	content := "hi"
+	if err := store.AppendMessages(ctx, "legacy", llm.Message{Role: "user", Content: &content}); err != nil {
+		t.Fatalf("AppendMessages: %v", err)
+	}
+	for _, id := range []string{"legacy", "missing"} {
+		if _, err := store.LoadMetadata(ctx, id); !errors.Is(err, ErrNotFound) {
+			t.Errorf("LoadMetadata(%q) err = %v, want ErrNotFound", id, err)
+		}
+	}
+
+	want := Metadata{
+		Parent:    "parent1",
+		Toolset:   "geminicli",
+		CreatedAt: time.Date(2026, 10, 21, 18, 0, 0, 0, time.UTC),
+	}
+	if err := store.SaveMetadata(ctx, "child1", want); err != nil {
+		t.Fatalf("SaveMetadata: %v", err)
+	}
+	got, err := store.LoadMetadata(ctx, "child1")
+	if err != nil {
+		t.Fatalf("LoadMetadata: %v", err)
+	}
+	if diff := cmp.Diff(want, *got); diff != "" {
+		t.Errorf("metadata mismatch (-want +got):\n%s", diff)
+	}
+
+	// Saving metadata must not create a message history.
+	if _, err := store.LoadSession(ctx, "child1"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("LoadSession after SaveMetadata err = %v, want ErrNotFound", err)
+	}
+
+	// Saving again replaces the previous metadata.
+	want.Toolset = "basic"
+	if err := store.SaveMetadata(ctx, "child1", want); err != nil {
+		t.Fatalf("SaveMetadata (replace): %v", err)
+	}
+	got, err = store.LoadMetadata(ctx, "child1")
+	if err != nil {
+		t.Fatalf("LoadMetadata (replace): %v", err)
+	}
+	if got.Toolset != "basic" {
+		t.Errorf("Toolset after replace = %q, want basic", got.Toolset)
+	}
+
+	if err := store.SaveMetadata(ctx, "Not Valid", want); err == nil {
+		t.Error("SaveMetadata with an invalid session name should fail")
 	}
 }

@@ -153,7 +153,7 @@ func run(ctx context.Context, opts agent.RunOptions, sessionName string, toolset
 
 	harness := agent.NewHarness(llmClient, sandboxClient, toolsRegistry, opts)
 
-	session, err := harness.BuildSession(ctx, sessionStore, sessionName)
+	session, err := harness.BuildSession(ctx, sessionStore, sessionName, sessions.Metadata{Toolset: toolset.Name()})
 	if err != nil {
 		return fmt.Errorf("building session: %w", err)
 	}

@@ -18,6 +18,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"sigs.k8s.io/agent-sandbox/examples/sandboxed-tools/pkg/llm"
+	"sigs.k8s.io/agent-sandbox/examples/sandboxed-tools/pkg/sessions"
 )
 
 // newTestSession returns a Session backed by a scratch backup directory.
@@ -178,5 +182,58 @@ func TestPruneBackups_ZeroKeepCountDeletesEverything(t *testing.T) {
 
 	if got := remainingBackups(t, session); len(got) != 0 {
 		t.Errorf("remaining backups = %v, want 0", got)
+	}
+}
+
+func TestBuildSession_Metadata(t *testing.T) {
+	ctx := t.Context()
+	store := sessions.NewFileStore(t.TempDir())
+	harness := NewHarness(nil, nil, nil, RunOptions{Namespace: "ns", HomeDir: "/home/x"})
+
+	// A new session persists the metadata it was built with, stamping the
+	// creation time.
+	before := time.Now()
+	session, err := harness.BuildSession(ctx, store, "child1", sessions.Metadata{Parent: "parent1", Toolset: "geminicli"})
+	if err != nil {
+		t.Fatalf("BuildSession (new): %v", err)
+	}
+	if session.Metadata.Parent != "parent1" || session.Metadata.Toolset != "geminicli" {
+		t.Errorf("new session metadata = %+v, want parent1/geminicli", session.Metadata)
+	}
+	if session.Metadata.CreatedAt.Before(before) {
+		t.Errorf("CreatedAt = %v, want >= %v", session.Metadata.CreatedAt, before)
+	}
+	stored, err := store.LoadMetadata(ctx, "child1")
+	if err != nil {
+		t.Fatalf("LoadMetadata: %v", err)
+	}
+	if stored.Parent != "parent1" || stored.Toolset != "geminicli" || stored.CreatedAt.IsZero() {
+		t.Errorf("stored metadata = %+v, want parent1/geminicli with CreatedAt", *stored)
+	}
+
+	// Resuming keeps the stored metadata even if the caller passes other values.
+	resumed, err := harness.BuildSession(ctx, store, "child1", sessions.Metadata{Toolset: "basic"})
+	if err != nil {
+		t.Fatalf("BuildSession (resume): %v", err)
+	}
+	if !resumed.Metadata.CreatedAt.Equal(session.Metadata.CreatedAt) || resumed.Metadata.Parent != "parent1" || resumed.Metadata.Toolset != "geminicli" {
+		t.Errorf("resumed metadata = %+v, want the stored %+v", resumed.Metadata, session.Metadata)
+	}
+
+	// A session recorded before metadata existed keeps zero metadata rather
+	// than being backfilled.
+	content := "hello"
+	if err := store.AppendMessages(ctx, "legacy", llm.Message{Role: "user", Content: &content}); err != nil {
+		t.Fatalf("AppendMessages: %v", err)
+	}
+	legacy, err := harness.BuildSession(ctx, store, "legacy", sessions.Metadata{Toolset: "basic"})
+	if err != nil {
+		t.Fatalf("BuildSession (legacy): %v", err)
+	}
+	if legacy.Metadata != (sessions.Metadata{}) {
+		t.Errorf("legacy metadata = %+v, want zero", legacy.Metadata)
+	}
+	if _, err := store.LoadMetadata(ctx, "legacy"); err == nil {
+		t.Error("legacy session must not get metadata written")
 	}
 }

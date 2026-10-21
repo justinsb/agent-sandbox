@@ -127,6 +127,11 @@ type Session struct {
 	// sessionStore is the store for session state.
 	sessionStore sessions.Store
 
+	// Metadata records where the session came from (its parent, if any) and
+	// which toolset it runs with. It is persisted when the session is
+	// created; sessions recorded before metadata existed have zero values.
+	Metadata sessions.Metadata
+
 	// messages is a list of all the messages in the current session chat.
 	messages []llm.Message
 
@@ -698,8 +703,11 @@ func NewHarness(llmClient llm.ChatClient, sandboxClient *SandboxClient, toolsReg
 }
 
 // BuildSession creates a Session named sessionName, loading any existing
-// history from the session store.
-func (h *Harness) BuildSession(ctx context.Context, sessionStore sessions.Store, sessionName string) (*Session, error) {
+// history and metadata from the session store. metadata describes the
+// session if it is new (CreatedAt is filled in if unset); for a session that
+// already has metadata, the stored metadata wins, so a session keeps its
+// parent and toolset across resumes.
+func (h *Harness) BuildSession(ctx context.Context, sessionStore sessions.Store, sessionName string, metadata sessions.Metadata) (*Session, error) {
 	// Session names become Kubernetes object names and filesystem path
 	// components, so validate here even though front ends generally do too.
 	if err := sessions.ValidateSessionName(sessionName); err != nil {
@@ -726,6 +734,25 @@ func (h *Harness) BuildSession(ctx context.Context, sessionStore sessions.Store,
 		return nil, fmt.Errorf("loading session: %w", err)
 	}
 	session.messages = messages
+
+	stored, err := sessionStore.LoadMetadata(ctx, session.Name)
+	switch {
+	case err == nil:
+		session.Metadata = *stored
+	case errors.Is(err, sessions.ErrNotFound) && len(messages) > 0:
+		// A session recorded before metadata existed; leave the zero value
+		// rather than inventing a creation time or parent for it.
+	case errors.Is(err, sessions.ErrNotFound):
+		if metadata.CreatedAt.IsZero() {
+			metadata.CreatedAt = time.Now()
+		}
+		if err := sessionStore.SaveMetadata(ctx, session.Name, metadata); err != nil {
+			return nil, fmt.Errorf("saving session metadata: %w", err)
+		}
+		session.Metadata = metadata
+	default:
+		return nil, fmt.Errorf("loading session metadata: %w", err)
+	}
 
 	return session, nil
 }

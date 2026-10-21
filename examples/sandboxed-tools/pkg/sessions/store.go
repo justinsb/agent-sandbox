@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/agent-sandbox/examples/sandboxed-tools/pkg/llm"
@@ -31,6 +32,23 @@ import (
 // ErrNotFound is returned (wrapped) by Store.LoadSession when no session
 // with the given ID has been persisted.
 var ErrNotFound = errors.New("session not found")
+
+// Metadata describes a session beyond its message history: where it came
+// from and how it runs. It is written once, when the session is created.
+type Metadata struct {
+	// Parent is the name of the session that created this one, or "" for a
+	// top-level session (one started by a user rather than by another
+	// session).
+	Parent string `json:"parent,omitempty"`
+
+	// Toolset is the name of the toolset (tools + system prompt) the session
+	// runs with, so that a resumed session gets the tools its history was
+	// recorded against.
+	Toolset string `json:"toolset,omitempty"`
+
+	// CreatedAt is when the session was created.
+	CreatedAt time.Time `json:"createdAt"`
+}
 
 // Store defines the interface for chat session persistence.
 type Store interface {
@@ -41,6 +59,15 @@ type Store interface {
 
 	// AppendMessages appends a set of messages to the session's history.
 	AppendMessages(ctx context.Context, sessionID string, messages ...llm.Message) error
+
+	// LoadMetadata retrieves the session's metadata. It returns an error
+	// wrapping ErrNotFound if none was saved; sessions recorded before
+	// metadata existed have messages but no metadata.
+	LoadMetadata(ctx context.Context, sessionID string) (*Metadata, error)
+
+	// SaveMetadata persists the session's metadata, replacing any previous
+	// metadata.
+	SaveMetadata(ctx context.Context, sessionID string, metadata Metadata) error
 }
 
 // FileStore is a JSONL implementation of the Store interface.
@@ -62,6 +89,66 @@ func (s *FileStore) ensureDir(sessionID string) error {
 	dir := filepath.Join(s.basedir, sessionID, "sessions")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("failed to create session directory %s: %w", dir, err)
+	}
+	return nil
+}
+
+// metadataPath is the session's metadata file, a sibling of the sessions/
+// history directory.
+func (s *FileStore) metadataPath(sessionID string) string {
+	return filepath.Join(s.basedir, sessionID, "metadata.json")
+}
+
+// LoadMetadata reads the session's metadata file.
+func (s *FileStore) LoadMetadata(ctx context.Context, sessionID string) (*Metadata, error) {
+	log := klog.FromContext(ctx)
+
+	if err := ValidateSessionName(sessionID); err != nil {
+		return nil, err
+	}
+	p := s.metadataPath(sessionID)
+	log.V(2).Info("loading session metadata", "path", p)
+	data, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("session %q metadata: %w", sessionID, ErrNotFound)
+		}
+		return nil, fmt.Errorf("failed to read session metadata %s: %w", p, err)
+	}
+	var metadata Metadata
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return nil, fmt.Errorf("failed to decode session metadata %s: %w", p, err)
+	}
+	return &metadata, nil
+}
+
+// SaveMetadata writes the session's metadata file. It writes to a temporary
+// file and renames it into place, so a crash mid-write cannot leave a
+// truncated file behind.
+func (s *FileStore) SaveMetadata(ctx context.Context, sessionID string, metadata Metadata) error {
+	log := klog.FromContext(ctx)
+
+	if err := ValidateSessionName(sessionID); err != nil {
+		return err
+	}
+	if err := s.ensureDir(sessionID); err != nil {
+		return err
+	}
+
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("failed to marshal session metadata to json: %w", err)
+	}
+
+	p := s.metadataPath(sessionID)
+	log.V(2).Info("saving session metadata", "path", p)
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return fmt.Errorf("failed to write session metadata %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("failed to rename session metadata into place %s: %w", p, err)
 	}
 	return nil
 }
