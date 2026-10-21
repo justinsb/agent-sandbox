@@ -161,3 +161,68 @@ func TestFormatAge(t *testing.T) {
 		}
 	}
 }
+
+func TestReadSessionTool(t *testing.T) {
+	m := newTestManager(t)
+	registry := tools.NewRegistry()
+	New(m).RegisterTools(registry)
+	ctx := tools.WithCallerSession(context.Background(), "parent1")
+
+	childID, err := m.Spawn(ctx, "parent1", DefaultChildToolset, "What is up?")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Get(childID).Messages()
+
+	msg, err := registry.Call(ctx, noSandbox{}, llm.ToolCall{ID: "c", Function: llm.FunctionCall{Name: ReadSessionToolName, Arguments: `{"session_id":"` + childID + `"}`}})
+	if err != nil {
+		t.Fatalf("read_session: %v", err)
+	}
+	out := *msg.Content
+	for _, want := range []string{"Transcript of session " + childID + ": 2 messages", "--- #1 user ---\nWhat is up?", "--- #2 assistant ---"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("read_session = %q, want it to contain %q", out, want)
+		}
+	}
+	if strings.Contains(out, "system") {
+		t.Errorf("read_session = %q, must not include the system prompt", out)
+	}
+
+	other, err := m.Spawn(ctx, "parent2", DefaultChildToolset, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Call(ctx, noSandbox{}, llm.ToolCall{ID: "c", Function: llm.FunctionCall{Name: ReadSessionToolName, Arguments: `{"session_id":"` + other + `"}`}}); err == nil {
+		t.Error("reading another session's child should fail")
+	}
+}
+
+func TestRenderTranscript(t *testing.T) {
+	str := func(s string) *string { return &s }
+	msgs := []llm.Message{
+		{Role: "system", Content: str("secret system prompt")},
+		{Role: "user", Content: str("fix it")},
+		{Role: "assistant", ToolCalls: []llm.ToolCall{{Function: llm.FunctionCall{Name: "run_shell_command", Arguments: `{"command":"make"}`}}}},
+		{Role: "tool", Content: str(strings.Repeat("x", 5000))},
+		{Role: "assistant", Content: str("done")},
+	}
+
+	out := renderTranscript("s1", msgs, 0)
+	if strings.Contains(out, "secret") {
+		t.Errorf("system prompt leaked: %q", out)
+	}
+	for _, want := range []string{"4 messages", "#1 user", "-> run_shell_command({\"command\":\"make\"})", "[3000 more bytes truncated]", "#4 assistant\ndone"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("render = %q, want %q", out, want)
+		}
+	}
+
+	out = renderTranscript("s1", msgs, 2)
+	if !strings.Contains(out, "showing the last 2; 2 earlier messages omitted") || strings.Contains(out, "#1 user") || !strings.Contains(out, "#3 tool") {
+		t.Errorf("render(last 2) = %q, want only the last two messages, numbered from the start", out)
+	}
+
+	if got := truncate("héllo", 2); got != "h... [5 more bytes truncated]" {
+		t.Errorf("truncate on a rune boundary = %q", got)
+	}
+}

@@ -252,6 +252,24 @@ func (m *Manager) Describe(ctx context.Context, caller, sessionID string) (*Sess
 	return m.describe(ctx, sessionID, *metadata)
 }
 
+// Transcript returns the messages of sessionID on behalf of caller, which
+// must be its parent (ErrNotChild otherwise). For a loaded session it is a
+// snapshot taken without waiting for a turn in progress, so a parent can
+// read along while the child works.
+func (m *Manager) Transcript(ctx context.Context, caller, sessionID string) ([]llm.Message, error) {
+	if _, err := m.childMetadata(ctx, caller, sessionID); err != nil {
+		return nil, err
+	}
+	if active := m.Get(sessionID); active != nil {
+		return active.Session.Messages(), nil
+	}
+	messages, err := m.store.LoadSession(ctx, sessionID)
+	if err != nil && !errors.Is(err, sessions.ErrNotFound) {
+		return nil, fmt.Errorf("loading session %q: %w", sessionID, err)
+	}
+	return messages, nil
+}
+
 // childMetadata loads sessionID's metadata, checking that caller is its
 // parent.
 func (m *Manager) childMetadata(ctx context.Context, caller, sessionID string) (*sessions.Metadata, error) {

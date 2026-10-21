@@ -310,3 +310,35 @@ func TestManagedSessionState_TracksRunningTurn(t *testing.T) {
 		t.Errorf("state after failed turn = %+v, want idle, one completed turn, an error", state)
 	}
 }
+
+func TestManagerTranscript(t *testing.T) {
+	ctx := t.Context()
+	m, harnesses := newTestManager(t, &llm.ElizaClient{})
+
+	child, err := m.Spawn(ctx, "parent1", "basic", "hello there")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Get(child).Messages() // wait for the turn
+
+	msgs, err := m.Transcript(ctx, "parent1", child)
+	if err != nil {
+		t.Fatalf("Transcript: %v", err)
+	}
+	if len(msgs) != 3 || *msgs[1].Content != "hello there" {
+		t.Errorf("transcript = %+v, want system, prompt, reply", msgs)
+	}
+	if _, err := m.Transcript(ctx, "parent2", child); !errors.Is(err, ErrNotChild) {
+		t.Errorf("Transcript by non-parent err = %v, want ErrNotChild", err)
+	}
+
+	// Not loaded (after a restart): read from the store.
+	m2 := NewManager(ctx, m.store)
+	for name, h := range harnesses {
+		m2.AddToolset(name, h)
+	}
+	msgs, err = m2.Transcript(ctx, "parent1", child)
+	if err != nil || len(msgs) != 3 {
+		t.Errorf("Transcript after restart = %d messages, %v; want 3", len(msgs), err)
+	}
+}
