@@ -243,9 +243,10 @@ Complete, runnable manifests for both (plus an end-to-end SDK client) live in
 | `--stream-chunk-size` | `4096` | Buffer size in bytes for streaming process stdout/stderr chunks. |
 | `--auth-token-sha256` | (none) | Hex SHA-256 digest of the bearer token clients must send. Mutually exclusive with `--auth-token-file`, `--auth-public-key`, and `--auth-public-key-file`. See [Client authentication](#client-authentication). |
 | `--auth-token-file` | (none) | File holding the bearer token (e.g. a mounted Secret). Mutually exclusive with `--auth-token-sha256`, `--auth-public-key`, and `--auth-public-key-file`. |
-| `--auth-public-key` | (none) | Base64 raw 32-byte ed25519 public key used to verify signed bearer tokens. Mutually exclusive with public key file and token flags. See [Client authentication](#client-authentication). |
-| `--auth-public-key-file` | (none) | File holding a base64 raw 32-byte ed25519 public key. Alternative to `--auth-public-key`. |
+| `--auth-public-key` | (none) | Raw 32-byte ed25519 public key in standard base64 (padded or not) used to verify signed bearer tokens. Mutually exclusive with public key file and token flags. See [Client authentication](#client-authentication). |
+| `--auth-public-key-file` | (none) | File holding a standard-base64 ed25519 public key. Alternative to `--auth-public-key`. |
 | `--auth-audience` | (none) | Audience string required in signed bearer tokens. Requires `--auth-public-key` or `--auth-public-key-file`. |
+| `--auth-max-token-ttl` | `1h` | Longest lifetime (`exp - iat`) a signed bearer token may claim; longer tokens are rejected. Only used with a public key flag. |
 | `--version` | | Print version info and exit. |
 
 ## Talking to sandboxd
@@ -450,8 +451,11 @@ bearer tokens (verified against an ed25519 public key).
 ### Asymmetric signed tokens (`--auth-public-key`)
 
 With `--auth-public-key=<base64>` (or `--auth-public-key-file=<path>`), `sandboxd`
-verifies ed25519-signed bearer tokens. Optionally, `--auth-audience=<string>` restricts
-acceptance to tokens minted for that specific sandbox.
+verifies ed25519-signed bearer tokens. The key is the raw 32-byte public key in
+standard base64 (RFC 4648 section 4), padded or unpadded; no other encoding is
+accepted. Optionally, `--auth-audience=<string>` restricts acceptance to tokens
+minted for that specific sandbox, and `--auth-max-token-ttl` (default `1h`) caps
+the lifetime a token may claim.
 
 #### Why this shape
 
@@ -487,7 +491,10 @@ The daemon verifies:
 1. The ed25519 signature on the raw payload bytes against `--auth-public-key`.
 2. `exp` is in the future (`exp > now`).
 3. `iat` is not more than 60 seconds in the future (`iat <= now + 60s`, allowing for clock skew).
-4. `aud` matches `--auth-audience` when that flag is configured.
+4. `exp` is after `iat`, and `exp - iat` does not exceed `--auth-max-token-ttl` (default one
+   hour). The daemon bounds a token's lifetime so a captured token stops working within that
+   window no matter what the signer asked for.
+5. `aud` matches `--auth-audience` when that flag is configured.
 
 Any token failing verification is rejected with `UNAUTHENTICATED` (`401` on REST,
 `codes.Unauthenticated` on gRPC). `GET /v1/health` stays open without a token.

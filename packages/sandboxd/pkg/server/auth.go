@@ -77,7 +77,16 @@ func LoadAuthTokenFile(path string) ([]byte, error) {
 	return digest[:], nil
 }
 
-// ParseAuthPublicKey decodes a base64 raw 32-byte ed25519 public key.
+// DefaultAuthMaxTokenTTL is the longest lifetime (exp - iat) a signed token
+// may claim when Options.AuthMaxTokenTTL is zero. A cap enforced by the daemon
+// bounds how long a captured token stays usable regardless of how the client
+// mints tokens.
+const DefaultAuthMaxTokenTTL = time.Hour
+
+// ParseAuthPublicKey decodes a raw 32-byte ed25519 public key encoded with the
+// standard base64 alphabet (RFC 4648 section 4), with or without padding. No
+// other encoding is accepted, so a misconfigured key fails at startup rather
+// than being read as a different key.
 func ParseAuthPublicKey(base64Key string) (ed25519.PublicKey, error) {
 	s := strings.TrimSpace(base64Key)
 	if s == "" {
@@ -88,13 +97,7 @@ func ParseAuthPublicKey(base64Key string) (ed25519.PublicKey, error) {
 		b, err = base64.RawStdEncoding.DecodeString(s)
 	}
 	if err != nil {
-		b, err = base64.URLEncoding.DecodeString(s)
-	}
-	if err != nil {
-		b, err = base64.RawURLEncoding.DecodeString(s)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("decode auth public key: %w", err)
+		return nil, fmt.Errorf("decode auth public key (standard base64): %w", err)
 	}
 	if len(b) != ed25519.PublicKeySize {
 		return nil, fmt.Errorf("auth public key: want %d bytes, got %d", ed25519.PublicKeySize, len(b))
@@ -102,8 +105,9 @@ func ParseAuthPublicKey(base64Key string) (ed25519.PublicKey, error) {
 	return ed25519.PublicKey(b), nil
 }
 
-// LoadAuthPublicKeyFile reads a base64 raw 32-byte ed25519 public key from path.
-// Surrounding whitespace is ignored; an empty file is an error.
+// LoadAuthPublicKeyFile reads a standard-base64 ed25519 public key from path,
+// in the same format ParseAuthPublicKey accepts. Surrounding whitespace is
+// ignored; an empty file is an error.
 func LoadAuthPublicKeyFile(path string) (ed25519.PublicKey, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -113,11 +117,7 @@ func LoadAuthPublicKeyFile(path string) (ed25519.PublicKey, error) {
 	if trimmed == "" {
 		return nil, errors.New("auth public key file is empty")
 	}
-	key, err := ParseAuthPublicKey(trimmed)
-	if err != nil && len(raw) == ed25519.PublicKeySize {
-		return ed25519.PublicKey(raw), nil
-	}
-	return key, err
+	return ParseAuthPublicKey(trimmed)
 }
 
 // authChecker validates "Authorization: Bearer <token>" headers.
@@ -151,13 +151,18 @@ func (c *tokenChecker) valid(header string) bool {
 type signedTokenChecker struct {
 	publicKey ed25519.PublicKey
 	audience  string
+	maxTTL    time.Duration
 	clock     func() time.Time
 }
 
-func newSignedTokenChecker(pubKey ed25519.PublicKey, audience string) *signedTokenChecker {
+func newSignedTokenChecker(pubKey ed25519.PublicKey, audience string, maxTTL time.Duration) *signedTokenChecker {
+	if maxTTL <= 0 {
+		maxTTL = DefaultAuthMaxTokenTTL
+	}
 	return &signedTokenChecker{
 		publicKey: pubKey,
 		audience:  audience,
+		maxTTL:    maxTTL,
 		clock:     time.Now,
 	}
 }
@@ -213,6 +218,11 @@ func (c *signedTokenChecker) valid(header string) bool {
 		return false
 	}
 	if payload.Iat > now+60 {
+		return false
+	}
+	// The daemon, not the client, bounds how long a token can live, so a
+	// captured token expires within maxTTL even if the signer asked for more.
+	if payload.Exp <= payload.Iat || payload.Exp-payload.Iat > int64(c.maxTTL/time.Second) {
 		return false
 	}
 	if c.audience != "" && payload.Aud != c.audience {

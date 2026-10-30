@@ -87,6 +87,7 @@ type config struct {
 	authPublicKey     string
 	authPublicKeyFile string
 	authAudience      string
+	authMaxTokenTTL   time.Duration
 	printVersion      bool
 }
 
@@ -115,11 +116,13 @@ func main() {
 	flag.StringVar(&cfg.authTokenFile, "auth-token-file", "",
 		"File holding a bearer token (e.g. a mounted Secret), required like --auth-token-sha256. Mutually exclusive with it and public key flags.")
 	flag.StringVar(&cfg.authPublicKey, "auth-public-key", "",
-		"Base64 raw 32-byte ed25519 public key used to verify signed bearer tokens required on every gRPC call and REST request except GET /v1/health. Mutually exclusive with --auth-public-key-file, --auth-token-sha256, and --auth-token-file.")
+		"Raw 32-byte ed25519 public key in standard base64 (padded or not) used to verify signed bearer tokens required on every gRPC call and REST request except GET /v1/health. Mutually exclusive with --auth-public-key-file, --auth-token-sha256, and --auth-token-file.")
 	flag.StringVar(&cfg.authPublicKeyFile, "auth-public-key-file", "",
-		"File holding a base64 raw 32-byte ed25519 public key, required like --auth-public-key. Mutually exclusive with it and token flags.")
+		"File holding a standard-base64 ed25519 public key, required like --auth-public-key. Mutually exclusive with it and token flags.")
 	flag.StringVar(&cfg.authAudience, "auth-audience", "",
 		"Audience required in signed bearer tokens. Requires --auth-public-key or --auth-public-key-file.")
+	flag.DurationVar(&cfg.authMaxTokenTTL, "auth-max-token-ttl", server.DefaultAuthMaxTokenTTL,
+		"Longest lifetime (exp - iat) a signed bearer token may claim; longer tokens are rejected. Only used with --auth-public-key or --auth-public-key-file.")
 	flag.BoolVar(&cfg.printVersion, "version", false, "Print version information and exit.")
 	zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -232,6 +235,7 @@ func run(cfg *config, log logr.Logger) error {
 		AuthTokenSHA256:   authDigest,
 		AuthPublicKey:     authPubKey,
 		AuthAudience:      authAudience,
+		AuthMaxTokenTTL:   cfg.authMaxTokenTTL,
 		Log:               log.WithName("rest"),
 	})
 	if err != nil {

@@ -76,7 +76,11 @@ type Options struct {
 	// AuthAudience, when set, is the required audience for signed tokens.
 	// Requires AuthPublicKey.
 	AuthAudience string
-	Log          logr.Logger
+	// AuthMaxTokenTTL caps the lifetime (exp - iat) a signed token may claim.
+	// Zero selects DefaultAuthMaxTokenTTL; negative is an error. Only used
+	// with AuthPublicKey.
+	AuthMaxTokenTTL time.Duration
+	Log             logr.Logger
 }
 
 // Server bundles the gRPC ProcessService and FileWatcherService and the REST
@@ -101,6 +105,9 @@ func New(opts Options) (*Server, error) {
 	if opts.AuthAudience != "" && opts.AuthPublicKey == nil {
 		return nil, errors.New("AuthAudience requires AuthPublicKey")
 	}
+	if opts.AuthMaxTokenTTL < 0 {
+		return nil, fmt.Errorf("AuthMaxTokenTTL must not be negative, got %s", opts.AuthMaxTokenTTL)
+	}
 
 	registry := processmanager.NewProcessRegistry()
 	s := &Server{
@@ -121,7 +128,7 @@ func New(opts Options) (*Server, error) {
 			return nil, fmt.Errorf("AuthPublicKey must be %d bytes, got %d",
 				ed25519.PublicKeySize, len(opts.AuthPublicKey))
 		}
-		s.auth = newSignedTokenChecker(opts.AuthPublicKey, opts.AuthAudience)
+		s.auth = newSignedTokenChecker(opts.AuthPublicKey, opts.AuthAudience, opts.AuthMaxTokenTTL)
 	}
 	return s, nil
 }

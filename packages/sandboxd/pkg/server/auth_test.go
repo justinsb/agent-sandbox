@@ -467,6 +467,15 @@ func TestServerNewAuthValidation(t *testing.T) {
 	})
 	require.Error(t, err)
 
+	// A negative AuthMaxTokenTTL must be rejected.
+	_, err = New(Options{
+		RootDir:         t.TempDir(),
+		AuthPublicKey:   pub,
+		AuthMaxTokenTTL: -time.Second,
+		Log:             logr.Discard(),
+	})
+	require.Error(t, err)
+
 	// AuthPublicKey with invalid length must be rejected.
 	_, err = New(Options{
 		RootDir:       t.TempDir(),
@@ -480,25 +489,30 @@ func TestParseAuthPublicKey(t *testing.T) {
 	pub, _, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
 
-	// Standard base64
+	// Standard base64, padded, with surrounding whitespace.
 	got, err := ParseAuthPublicKey(base64.StdEncoding.EncodeToString(pub) + "\n")
 	require.NoError(t, err)
 	require.Equal(t, pub, got)
 
-	// Raw standard base64 (unpadded)
+	// Standard base64, unpadded.
 	got, err = ParseAuthPublicKey(base64.RawStdEncoding.EncodeToString(pub))
 	require.NoError(t, err)
 	require.Equal(t, pub, got)
 
-	// URL base64
-	got, err = ParseAuthPublicKey(base64.URLEncoding.EncodeToString(pub))
-	require.NoError(t, err)
-	require.Equal(t, pub, got)
-
-	// Raw URL base64
-	got, err = ParseAuthPublicKey(base64.RawURLEncoding.EncodeToString(pub))
-	require.NoError(t, err)
-	require.Equal(t, pub, got)
+	// The URL-safe alphabet is not accepted: find a key whose standard
+	// encoding uses '+' or '/' so the two alphabets differ, then check the
+	// URL-safe form is rejected rather than decoded as a different key.
+	for {
+		k, _, err := ed25519.GenerateKey(rand.Reader)
+		require.NoError(t, err)
+		std := base64.StdEncoding.EncodeToString(k)
+		if !strings.ContainsAny(std, "+/") {
+			continue
+		}
+		_, err = ParseAuthPublicKey(base64.URLEncoding.EncodeToString(k))
+		require.Error(t, err)
+		break
+	}
 
 	// Empty string
 	_, err = ParseAuthPublicKey("   \n")
@@ -525,12 +539,11 @@ func TestLoadAuthPublicKeyFile(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, pub, got)
 
-	// Raw 32-byte binary file
+	// A raw binary key is not accepted; the file must hold base64.
 	rawPath := filepath.Join(dir, "pubkey.bin")
 	require.NoError(t, os.WriteFile(rawPath, pub, 0o600))
-	got, err = LoadAuthPublicKeyFile(rawPath)
-	require.NoError(t, err)
-	require.Equal(t, pub, got)
+	_, err = LoadAuthPublicKeyFile(rawPath)
+	require.Error(t, err)
 
 	// Empty file
 	emptyPath := filepath.Join(dir, "empty")
@@ -541,6 +554,48 @@ func TestLoadAuthPublicKeyFile(t *testing.T) {
 	// Missing file
 	_, err = LoadAuthPublicKeyFile(filepath.Join(dir, "missing"))
 	require.Error(t, err)
+}
+
+func TestSignedTokenLifetimeCapped(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	req := &processv1.ExecuteRequest{Config: &processv1.ProcessConfig{Command: []string{"true"}}}
+
+	// Default cap is one hour: a two-hour token is rejected even though it is
+	// correctly signed and not yet expired.
+	srv, _ := newSignedAuthServer(t, pub, "")
+	handler := srv.RESTHandler()
+	client := newAuthGRPCClient(t, srv)
+
+	long, err := SignToken(priv, "", 2*time.Hour)
+	require.NoError(t, err)
+	h := http.Header{}
+	h.Set("Authorization", "Bearer "+long)
+	require.Equal(t, http.StatusUnauthorized, doRequest(handler, http.MethodGet, "/v1/files/a.txt", nil, h).Code)
+	_, err = client.Execute(withAuth(testCtx(t), "Bearer "+long), req)
+	require.Equal(t, codes.Unauthenticated, status.Code(err))
+
+	short, err := SignToken(priv, "", 5*time.Minute)
+	require.NoError(t, err)
+	h.Set("Authorization", "Bearer "+short)
+	require.Equal(t, http.StatusNoContent, doRequest(handler, http.MethodPut, "/v1/files/a.txt", []byte("x"), h).Code)
+
+	// A token whose exp is not after its iat is rejected.
+	inverted, err := SignTokenAt(priv, "", -time.Minute, time.Now().Add(2*time.Minute))
+	require.NoError(t, err)
+	h.Set("Authorization", "Bearer "+inverted)
+	require.Equal(t, http.StatusUnauthorized, doRequest(handler, http.MethodGet, "/v1/files/a.txt", nil, h).Code)
+
+	// Raising the cap admits the two-hour token.
+	relaxed, err := New(Options{
+		RootDir:         t.TempDir(),
+		AuthPublicKey:   pub,
+		AuthMaxTokenTTL: 3 * time.Hour,
+		Log:             logr.Discard(),
+	})
+	require.NoError(t, err)
+	h.Set("Authorization", "Bearer "+long)
+	require.Equal(t, http.StatusNoContent, doRequest(relaxed.RESTHandler(), http.MethodPut, "/v1/files/b.txt", []byte("x"), h).Code)
 }
 
 func TestSignToken(t *testing.T) {
